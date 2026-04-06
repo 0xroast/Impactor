@@ -6,11 +6,15 @@ use idevice::installation_proxy::InstallationProxyClient;
 use idevice::lockdown::LockdownClient;
 use idevice::misagent::MisagentClient;
 use idevice::provider::UsbmuxdProvider;
-use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket};
+use idevice::remote_pairing::{
+    RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
+};
 use idevice::rsd::RsdHandshake;
+use idevice::tcp::adapter::Adapter;
+use idevice::tcp::handle::AdapterHandle;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdDevice};
 use idevice::utils::installation;
-use idevice::{IdeviceService, RemoteXpcClient};
+use idevice::{IdeviceService, RsdService, RemoteXpcClient};
 use plume_core::MobileProvision;
 
 use crate::Error;
@@ -386,6 +390,155 @@ impl Device {
         pairing_file.write_to_file(&cache_path).await?;
 
         Ok(pairing_file)
+    }
+
+    /// Establish a TLS-PSK tunnel to a paired Apple TV and discover RSD services.
+    /// This is the post-pairing step that gives access to InstallationProxy, AFC, etc.
+    ///
+    /// `pin` is needed because the RPPairing path runs a full `connect` (SRP exchange)
+    /// even for existing pairing files. For re-connections where the user already paired,
+    /// pass the same PIN or the device may prompt again.
+    pub async fn establish_tvos_tunnel(
+        &self,
+        pin: String,
+        cache_dir: PathBuf,
+    ) -> Result<(AdapterHandle, RsdHandshake), Error> {
+        let (ip, port) = self
+            .network_address
+            .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
+
+        let connect_addr = std::net::SocketAddr::new(ip, port);
+
+        // Load or generate pairing file
+        let cache_path = cache_dir.join(format!("plume_{}.plist", self.udid));
+        let mut pairing_file = if cache_path.exists() {
+            RpPairingFile::read_from_file(&cache_path).await?
+        } else {
+            let suffix: String = uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(6)
+                .collect();
+            RpPairingFile::generate(&format!("plume-{suffix}"))
+        };
+
+        // Connect via RPPairing binary protocol
+        let stream = tokio::net::TcpStream::connect(connect_addr)
+            .await
+            .map_err(|e| {
+                Error::Other(format!("Could not connect to Apple TV at {connect_addr}: {e}"))
+            })?;
+        let conn = RpPairingSocket::new(stream);
+
+        let hostname = pairing_file.identifier.clone();
+        let tunnel = {
+            let mut rpc = RemotePairingClient::new(conn, &hostname, &mut pairing_file);
+            rpc.connect(
+                move |_: u8| {
+                    let p = pin.clone();
+                    async move { p }
+                },
+                0u8,
+            )
+            .await
+            .map_err(|e| Error::Other(format!("Pairing/verification failed: {e}")))?;
+
+            let tunnel_port = rpc
+                .create_tcp_listener()
+                .await
+                .map_err(|e| Error::Other(format!("Failed to create tunnel listener: {e}")))?;
+
+            let tunnel_addr = std::net::SocketAddr::new(connect_addr.ip(), tunnel_port);
+            let tunnel_stream = tokio::net::TcpStream::connect(tunnel_addr)
+                .await
+                .map_err(|e| Error::Other(format!("TLS tunnel connect failed: {e}")))?;
+
+            connect_tls_psk_tunnel_native(tunnel_stream, rpc.encryption_key())
+                .await
+                .map_err(|e| Error::Other(format!("TLS-PSK tunnel handshake failed: {e}")))?
+        };
+
+        // Cache pairing file now that rpc is dropped
+        if !cache_path.exists() {
+            tokio::fs::create_dir_all(&cache_dir).await?;
+            pairing_file.write_to_file(&cache_path).await?;
+        }
+
+        let client_ip: std::net::IpAddr = tunnel
+            .info
+            .client_address
+            .parse()
+            .map_err(|e| Error::Other(format!("Invalid tunnel client address: {e}")))?;
+        let server_ip: std::net::IpAddr = tunnel
+            .info
+            .server_address
+            .parse()
+            .map_err(|e| Error::Other(format!("Invalid tunnel server address: {e}")))?;
+        let rsd_port = tunnel.info.server_rsd_port;
+
+        let raw = tunnel.into_inner();
+        let adapter = Adapter::new(Box::new(raw), client_ip, server_ip);
+        let mut adapter_handle = adapter.to_async_handle();
+
+        let rsd_stream = adapter_handle
+            .connect(rsd_port)
+            .await
+            .map_err(|e| Error::Other(format!("RSD connection failed: {e}")))?;
+        let handshake = RsdHandshake::new(rsd_stream)
+            .await
+            .map_err(|e| Error::Other(format!("RSD handshake failed: {e}")))?;
+
+        Ok((adapter_handle, handshake))
+    }
+
+    /// Install an IPA on a paired Apple TV over a TLS-PSK tunnel.
+    /// Establishes tunnel, uploads via AFC, installs via InstallationProxy.
+    pub async fn install_app_tvos(
+        &self,
+        app_path: &PathBuf,
+        pin: String,
+        cache_dir: PathBuf,
+    ) -> Result<(), Error> {
+        let (mut adapter, mut handshake) =
+            self.establish_tvos_tunnel(pin, cache_dir).await?;
+
+        // Upload IPA via AFC
+        let mut afc = idevice::afc::AfcClient::connect_rsd(&mut adapter, &mut handshake)
+            .await
+            .map_err(|e| Error::Other(format!("AFC connection failed: {e}")))?;
+
+        let ipa_data = tokio::fs::read(app_path).await?;
+        let staging_path = "/PublicStaging/staging.ipa";
+
+        afc.mk_dir("/PublicStaging")
+            .await
+            .ok(); // ignore if exists
+        {
+            let mut f = afc
+                .open(staging_path, AfcFopenMode::Wr)
+                .await
+                .map_err(|e| Error::Other(format!("AFC open failed: {e}")))?;
+            f.write_entire(&ipa_data)
+                .await
+                .map_err(|e| Error::Other(format!("AFC upload failed: {e}")))?;
+        } // drop FileDescriptor before reusing afc
+
+        // Install via InstallationProxy
+        let mut instproxy =
+            InstallationProxyClient::connect_rsd(&mut adapter, &mut handshake)
+                .await
+                .map_err(|e| Error::Other(format!("InstallationProxy connection failed: {e}")))?;
+
+        instproxy
+            .install(staging_path, None)
+            .await
+            .map_err(|e| Error::Other(format!("Installation failed: {e}")))?;
+
+        // Cleanup staging file
+        afc.remove(staging_path).await.ok();
+
+        Ok(())
     }
 
     pub async fn install_app<F, Fut>(

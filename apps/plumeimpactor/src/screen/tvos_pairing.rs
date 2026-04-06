@@ -1,4 +1,6 @@
-use iced::widget::{button, column, container, pick_list, row, rule, scrollable, text, text_input};
+use iced::widget::{
+    button, column, container, pick_list, progress_bar, row, rule, scrollable, text, text_input,
+};
 use iced::{Center, Color, Element, Fill, Task};
 use plume_utils::discovery::mdns::MdnsDiscovery;
 use plume_utils::discovery::{DeviceDiscovery, DeviceType, DiscoveredDevice};
@@ -16,13 +18,22 @@ struct StatusMessage {
 
 impl StatusMessage {
     fn success(s: impl Into<String>) -> Self {
-        Self { content: s.into(), is_error: false }
+        Self {
+            content: s.into(),
+            is_error: false,
+        }
     }
     fn error(s: impl Into<String>) -> Self {
-        Self { content: s.into(), is_error: true }
+        Self {
+            content: s.into(),
+            is_error: true,
+        }
     }
     fn info(s: impl Into<String>) -> Self {
-        Self { content: s.into(), is_error: false }
+        Self {
+            content: s.into(),
+            is_error: false,
+        }
     }
     fn color(&self) -> Color {
         if self.is_error {
@@ -41,6 +52,19 @@ pub enum Message {
     PinChanged(String),
     Pair,
     PairComplete(Result<(), String>),
+    SelectIpa,
+    IpaSelected(Option<std::path::PathBuf>),
+    InstallApp,
+    InstallComplete(Result<(), String>),
+}
+
+/// Info about a successfully paired Apple TV, retained for installation.
+#[derive(Debug, Clone)]
+struct PairedDevice {
+    name: String,
+    hostname: String,
+    ip: std::net::IpAddr,
+    port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +75,9 @@ pub struct TvOsPairingScreen {
     scanning: bool,
     pairing: bool,
     status: Option<StatusMessage>,
+    paired_device: Option<PairedDevice>,
+    ipa_path: Option<std::path::PathBuf>,
+    installing: bool,
 }
 
 impl TvOsPairingScreen {
@@ -62,6 +89,9 @@ impl TvOsPairingScreen {
             scanning: false,
             pairing: false,
             status: None,
+            paired_device: None,
+            ipa_path: None,
+            installing: false,
         }
     }
 
@@ -136,7 +166,6 @@ impl TvOsPairingScreen {
             }
 
             Message::PinChanged(s) => {
-                // Only accept up to 6 digits
                 self.pin = s.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
                 Task::none()
             }
@@ -166,14 +195,22 @@ impl TvOsPairingScreen {
                 };
 
                 let name = dev.name.clone();
-                let hostname = dev.udid.clone().unwrap_or_else(|| {
-                    ip_str.replace('.', "-")
-                });
+                let hostname = dev
+                    .udid
+                    .clone()
+                    .unwrap_or_else(|| ip_str.replace('.', "-"));
                 let pin = self.pin.clone();
                 let cache_dir = get_data_path();
 
                 self.pairing = true;
                 self.status = Some(StatusMessage::info("Pairing..."));
+
+                let paired_info = PairedDevice {
+                    name: name.clone(),
+                    hostname: hostname.clone(),
+                    ip: ip_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    port,
+                };
 
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 std::thread::spawn(move || {
@@ -187,7 +224,108 @@ impl TvOsPairingScreen {
                             .pair_tvos(pin, cache_dir)
                             .await
                             .map(|_| ())
-                            .map_err(|e| format!("Pairing failed: {e}"))
+                            .map_err(|e| format!("{e}"))
+                    });
+                    let _ = tx.send((result, paired_info));
+                });
+
+                Task::perform(
+                    async move {
+                        std::thread::spawn(move || {
+                            rx.recv()
+                                .unwrap_or_else(|_| (Err("Pairing thread error".to_string()), PairedDevice {
+                                    name: String::new(),
+                                    hostname: String::new(),
+                                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                    port: 0,
+                                }))
+                        })
+                        .join()
+                        .unwrap()
+                    },
+                    |(result, _info)| {
+                        match result {
+                            Ok(()) => Message::PairComplete(Ok(())),
+                            Err(e) => Message::PairComplete(Err(e)),
+                        }
+                    },
+                )
+            }
+
+            Message::PairComplete(result) => {
+                self.pairing = false;
+                match result {
+                    Ok(_) => {
+                        // Reconstruct paired device info from the selected device
+                        if let Some(dev) = self.selected_device() {
+                            if let (Some(ip_str), Some(port)) = (&dev.ip_address, dev.port) {
+                                if let Ok(ip) = ip_str.parse() {
+                                    self.paired_device = Some(PairedDevice {
+                                        name: dev.name.clone(),
+                                        hostname: dev.udid.clone().unwrap_or_else(|| ip_str.replace('.', "-")),
+                                        ip,
+                                        port,
+                                    });
+                                }
+                            }
+                        }
+                        self.status = Some(StatusMessage::success(
+                            "Paired successfully! Select an IPA to install.",
+                        ));
+                        self.pin.clear();
+                    }
+                    Err(e) => {
+                        self.status = Some(StatusMessage::error(e));
+                    }
+                }
+                Task::none()
+            }
+
+            Message::SelectIpa => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("iOS/tvOS App", &["ipa", "tipa"])
+                        .set_title("Select IPA to install on Apple TV")
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::IpaSelected,
+            ),
+
+            Message::IpaSelected(path) => {
+                self.ipa_path = path;
+                Task::none()
+            }
+
+            Message::InstallApp => {
+                let Some(ref paired) = self.paired_device else {
+                    return Task::none();
+                };
+                let Some(ref ipa_path) = self.ipa_path else {
+                    return Task::none();
+                };
+
+                let name = paired.name.clone();
+                let hostname = paired.hostname.clone();
+                let ip = paired.ip;
+                let port = paired.port;
+                let ipa = ipa_path.clone();
+                let pin = self.pin.clone();
+                let cache_dir = get_data_path();
+
+                self.installing = true;
+                self.status = Some(StatusMessage::info("Installing..."));
+
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let result = rt.block_on(async move {
+                        let device = Device::new_tvos(name, hostname, ip, port);
+                        device
+                            .install_app_tvos(&ipa, pin, cache_dir)
+                            .await
+                            .map_err(|e| format!("{e}"))
                     });
                     let _ = tx.send(result);
                 });
@@ -196,22 +334,23 @@ impl TvOsPairingScreen {
                     async move {
                         std::thread::spawn(move || {
                             rx.recv()
-                                .unwrap_or_else(|_| Err("Pairing thread error".to_string()))
+                                .unwrap_or_else(|_| Err("Install thread error".to_string()))
                         })
                         .join()
                         .unwrap()
                     },
-                    Message::PairComplete,
+                    Message::InstallComplete,
                 )
             }
 
-            Message::PairComplete(result) => {
-                self.pairing = false;
+            Message::InstallComplete(result) => {
+                self.installing = false;
                 match result {
                     Ok(()) => {
-                        self.status =
-                            Some(StatusMessage::success("Paired successfully! You can now install apps on this Apple TV."));
-                        self.pin.clear();
+                        self.status = Some(StatusMessage::success(
+                            "App installed successfully on Apple TV!",
+                        ));
+                        self.ipa_path = None;
                     }
                     Err(e) => {
                         self.status = Some(StatusMessage::error(e));
@@ -226,9 +365,17 @@ impl TvOsPairingScreen {
         let mut content = column![].spacing(appearance::THEME_PADDING);
 
         // Scan button
-        let scan_label = if self.scanning { "Scanning..." } else { "Scan for Apple TVs" };
+        let scan_label = if self.scanning {
+            "Scanning..."
+        } else {
+            "Scan for Apple TVs"
+        };
         let scan_btn = button(text(scan_label).align_x(Center))
-            .on_press_maybe(if self.scanning { None } else { Some(Message::Scan) })
+            .on_press_maybe(if self.scanning {
+                None
+            } else {
+                Some(Message::Scan)
+            })
             .style(appearance::s_button)
             .width(Fill);
         content = content.push(scan_btn);
@@ -254,14 +401,13 @@ impl TvOsPairingScreen {
             );
         }
 
-        // PIN entry (only when a device is selected)
-        if self.selected_name.is_some() {
+        // PIN entry (only when a device is selected and not yet paired)
+        if self.selected_name.is_some() && self.paired_device.is_none() {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
 
-            content = content.push(
-                text("Enter the 6-digit PIN shown on your Apple TV screen:").size(13),
-            );
+            content =
+                content.push(text("Enter the 6-digit PIN shown on your Apple TV:").size(13));
 
             let pin_input = text_input("123456", &self.pin)
                 .on_input(Message::PinChanged)
@@ -270,7 +416,11 @@ impl TvOsPairingScreen {
             let pair_enabled = self.pin.len() == 6 && !self.pairing;
             let pair_label = if self.pairing { "Pairing..." } else { "Pair" };
             let pair_btn = button(text(pair_label).align_x(Center))
-                .on_press_maybe(if pair_enabled { Some(Message::Pair) } else { None })
+                .on_press_maybe(if pair_enabled {
+                    Some(Message::Pair)
+                } else {
+                    None
+                })
                 .style(appearance::s_button);
 
             content = content.push(
@@ -278,6 +428,55 @@ impl TvOsPairingScreen {
                     .spacing(appearance::THEME_PADDING)
                     .align_y(Center),
             );
+        }
+
+        // Install section (shown after successful pairing)
+        if self.paired_device.is_some() {
+            content = content
+                .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
+
+            // IPA file picker
+            let select_label = if let Some(ref path) = self.ipa_path {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Selected".to_string());
+                format!("Selected: {name}")
+            } else {
+                "Select IPA File".to_string()
+            };
+
+            let select_btn = button(text(select_label).align_x(Center))
+                .on_press_maybe(if self.installing {
+                    None
+                } else {
+                    Some(Message::SelectIpa)
+                })
+                .style(appearance::s_button)
+                .width(Fill);
+            content = content.push(select_btn);
+
+            // Install button
+            if self.ipa_path.is_some() {
+                let install_label = if self.installing {
+                    "Installing..."
+                } else {
+                    "Install on Apple TV"
+                };
+                let install_btn = button(text(install_label).align_x(Center))
+                    .on_press_maybe(if self.installing || self.ipa_path.is_none() {
+                        None
+                    } else {
+                        Some(Message::InstallApp)
+                    })
+                    .style(appearance::p_button)
+                    .width(Fill);
+                content = content.push(install_btn);
+            }
+
+            if self.installing {
+                content = content.push(progress_bar(0.0..=1.0, 0.5));
+            }
         }
 
         container(scrollable(content)).into()
