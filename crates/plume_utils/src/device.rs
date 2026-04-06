@@ -6,7 +6,7 @@ use idevice::installation_proxy::InstallationProxyClient;
 use idevice::lockdown::LockdownClient;
 use idevice::misagent::MisagentClient;
 use idevice::provider::UsbmuxdProvider;
-use idevice::remote_pairing::{RemotePairingClient, RpPairingFile};
+use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket};
 use idevice::rsd::RsdHandshake;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdDevice};
 use idevice::utils::installation;
@@ -44,6 +44,8 @@ pub struct Device {
     // On x86_64 macs, `is_mac` variable should never be true
     // since its only true if the device is added manually.
     pub is_mac: bool,
+    /// IP address and port for network-only Apple TV devices (no USB).
+    pub network_address: Option<(std::net::IpAddr, u16)>,
 }
 
 impl Device {
@@ -58,6 +60,20 @@ impl Device {
             device_id: usbmuxd_device.device_id.clone(),
             usbmuxd_device: Some(usbmuxd_device),
             is_mac: false,
+            network_address: None,
+        }
+    }
+
+    /// Create a Device representing a network Apple TV (no USB connection).
+    /// `hostname` is used as the stable identifier (e.g. "Apple-TV.local").
+    pub fn new_tvos(name: String, hostname: String, ip: std::net::IpAddr, port: u16) -> Self {
+        Device {
+            name,
+            udid: hostname,
+            device_id: 0,
+            usbmuxd_device: None,
+            is_mac: false,
+            network_address: Some((ip, port)),
         }
     }
 
@@ -324,6 +340,54 @@ impl Device {
         }
     }
 
+    /// Pair with a network Apple TV (tvOS 17.4+) using the RPPairing binary protocol.
+    /// Discovers the device via mDNS `_remotepairing._tcp.local.` then connects directly
+    /// over TCP. `pin` is the 6-digit code shown on the Apple TV screen.
+    /// The resulting pairing file is cached at `cache_dir/plume_<hostname>.plist`.
+    pub async fn pair_tvos(&self, pin: String, cache_dir: PathBuf) -> Result<RpPairingFile, Error> {
+        let (ip, port) = self
+            .network_address
+            .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
+
+        let cache_path = cache_dir.join(format!("plume_{}.plist", self.udid));
+
+        if cache_path.exists() {
+            return Ok(RpPairingFile::read_from_file(&cache_path).await?);
+        }
+
+        let addr = std::net::SocketAddr::new(ip, port);
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| Error::Other(format!("Failed to connect to Apple TV at {addr}: {e}")))?;
+
+        let conn = RpPairingSocket::new(stream);
+
+        let suffix: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(6)
+            .collect();
+        let hostname = format!("plume-{suffix}");
+
+        let mut pairing_file = RpPairingFile::generate(&hostname);
+        let mut pairing_client = RemotePairingClient::new(conn, &hostname, &mut pairing_file);
+        pairing_client
+            .connect(
+                move |_: u8| {
+                    let p = pin.clone();
+                    async move { p }
+                },
+                0u8,
+            )
+            .await?;
+
+        tokio::fs::create_dir_all(&cache_dir).await?;
+        pairing_file.write_to_file(&cache_path).await?;
+
+        Ok(pairing_file)
+    }
+
     pub async fn install_app<F, Fut>(
         &self,
         app_path: &PathBuf,
@@ -372,9 +436,9 @@ fn get_app_name_from_info(info: &Value) -> Option<String> {
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] {}",
+        let conn = if self.network_address.is_some() {
+            "WiFi (tvOS)"
+        } else {
             match &self.usbmuxd_device {
                 Some(device) => match &device.connection_type {
                     Connection::Usb => "USB",
@@ -382,9 +446,9 @@ impl fmt::Display for Device {
                     Connection::Unknown(_) => "Unknown",
                 },
                 None => "LOCAL",
-            },
-            self.name
-        )
+            }
+        };
+        write!(f, "[{conn}] {}", self.name)
     }
 }
 

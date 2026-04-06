@@ -2,6 +2,7 @@ pub(crate) mod general;
 mod package;
 mod progress;
 pub(crate) mod settings;
+mod tvos_pairing;
 mod utilties;
 mod windows;
 
@@ -74,6 +75,7 @@ pub enum Message {
     SettingsScreen(settings::Message),
     InstallerScreen(package::Message),
     ProgressScreen(progress::Message),
+    TvOsPairingScreen(tvos_pairing::Message),
     CertificateResetRequested(crate::certificate_reset::ConfirmationRequest),
     ConfirmCertificateReset,
     CancelCertificateReset,
@@ -97,12 +99,14 @@ pub struct Impactor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum ImpactorScreenType {
     Main,
     Utilities,
     Settings,
     Installer,
     Progress,
+    TvOsPairing,
 }
 
 enum ImpactorScreen {
@@ -111,6 +115,7 @@ enum ImpactorScreen {
     Settings(settings::SettingsScreen),
     Installer(package::PackageScreen),
     Progress(progress::ProgressScreen),
+    TvOsPairing(tvos_pairing::TvOsPairingScreen),
 }
 
 impl Impactor {
@@ -286,6 +291,7 @@ impl Impactor {
                     ImpactorScreen::Installer(_) => ImpactorScreenType::Progress,
                     ImpactorScreen::Settings(_) => return Task::none(),
                     ImpactorScreen::Progress(_) => return Task::none(),
+                    ImpactorScreen::TvOsPairing(_) => return Task::none(),
                 };
 
                 self.navigate_to_screen(next_screen);
@@ -302,6 +308,10 @@ impl Impactor {
                     Task::none()
                 }
                 ImpactorScreen::Progress(_) => {
+                    self.navigate_to_screen(ImpactorScreenType::Main);
+                    Task::none()
+                }
+                ImpactorScreen::TvOsPairing(_) => {
                     self.navigate_to_screen(ImpactorScreenType::Main);
                     Task::none()
                 }
@@ -460,6 +470,10 @@ impl Impactor {
                         return Task::done(Message::UtilitiesScreen(
                             utilties::Message::RefreshApps(rppairing_enabled),
                         ));
+                    } else if let general::Message::NavigateTvOsPairing = msg {
+                        self.current_screen =
+                            ImpactorScreen::TvOsPairing(tvos_pairing::TvOsPairingScreen::new());
+                        return Task::none();
                     }
 
                     task
@@ -642,6 +656,13 @@ impl Impactor {
                         }
                         _ => screen.update(msg).map(Message::ProgressScreen),
                     }
+                } else {
+                    Task::none()
+                }
+            }
+            Message::TvOsPairingScreen(msg) => {
+                if let ImpactorScreen::TvOsPairing(ref mut screen) = self.current_screen {
+                    screen.update(msg).map(Message::TvOsPairingScreen)
                 } else {
                     Task::none()
                 }
@@ -861,6 +882,9 @@ impl Impactor {
                 screen.view(has_device).map(Message::InstallerScreen)
             }
             ImpactorScreen::Progress(screen) => screen.view().map(Message::ProgressScreen),
+            ImpactorScreen::TvOsPairing(screen) => {
+                screen.view().map(Message::TvOsPairingScreen)
+            }
         }
     }
 
@@ -872,11 +896,12 @@ impl Impactor {
             .map(String::as_str)
             .unwrap_or("No Device");
 
-        let right_button = if matches!(self.current_screen, ImpactorScreen::Settings(_)) {
-            button(appearance::icon(appearance::CHEVRON_BACK))
-                .on_press(Message::PreviousScreen)
-                .style(appearance::s_button)
-        } else if matches!(self.current_screen, ImpactorScreen::Utilities(_)) {
+        let right_button = if matches!(
+            self.current_screen,
+            ImpactorScreen::Settings(_)
+                | ImpactorScreen::Utilities(_)
+                | ImpactorScreen::TvOsPairing(_)
+        ) {
             button(appearance::icon(appearance::CHEVRON_BACK))
                 .on_press(Message::PreviousScreen)
                 .style(appearance::s_button)
@@ -978,7 +1003,13 @@ impl Impactor {
             ImpactorScreenType::Progress => {
                 self.current_screen = ImpactorScreen::Progress(progress::ProgressScreen::new());
             }
-            _ => {}
+            ImpactorScreenType::TvOsPairing => {
+                self.current_screen =
+                    ImpactorScreen::TvOsPairing(tvos_pairing::TvOsPairingScreen::new());
+            }
+            ImpactorScreenType::Installer => {
+                // Installer screen is set directly via NavigateToInstaller in MainScreen handler.
+            }
         }
     }
 

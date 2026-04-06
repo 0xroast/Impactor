@@ -1,6 +1,7 @@
 mod bundle;
 mod cgbi;
 mod device;
+pub mod discovery;
 mod options;
 mod package;
 mod signer;
@@ -22,6 +23,8 @@ pub use options::{
 pub use package::Package; // Package helper
 pub use signer::Signer; // Signer
 pub use tweak::Tweak; // Tweak helper
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 use thiserror::Error as ThisError;
 #[derive(Debug, ThisError)]
@@ -68,7 +71,7 @@ pub trait PlistInfoTrait {
     fn get_build_version(&self) -> Option<String>;
 }
 
-pub async fn copy_dir_recursively(src: &Path, dst: &Path) -> Result<(), Error> {
+pub async fn copy_dir_recursively(src: &Path, dst: &Path) -> Result<()> {
     use tokio::fs;
 
     fs::create_dir_all(dst).await?;

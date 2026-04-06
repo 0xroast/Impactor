@@ -33,6 +33,7 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                                     device_id: u32::MAX,
                                     usbmuxd_device: None,
                                     is_mac: true,
+                                    network_address: None,
                                 }));
                             }
                         }
