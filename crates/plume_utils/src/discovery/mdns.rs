@@ -18,38 +18,6 @@ impl MdnsDiscovery {
             ],
         }
     }
-
-    fn parse_service_properties(
-        &self,
-        properties: &HashMap<String, String>,
-        _service_type: &str,
-    ) -> (DeviceType, Option<String>, Option<String>) {
-        let device_class = properties
-            .get("DeviceClass")
-            .or_else(|| properties.get("deviceClass"))
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        let device_type = if !device_class.is_empty() {
-            DeviceType::from_device_class(device_class)
-        } else if let Some(product_type) = properties.get("ProductType") {
-            DeviceType::from_product_type(product_type)
-        } else {
-            DeviceType::Unknown
-        };
-
-        let product_type = properties
-            .get("ProductType")
-            .or_else(|| properties.get("model"))
-            .cloned();
-
-        let os_version = properties
-            .get("OSVersion")
-            .or_else(|| properties.get("osVersion"))
-            .cloned();
-
-        (device_type, product_type, os_version)
-    }
 }
 
 impl Default for MdnsDiscovery {
@@ -64,51 +32,76 @@ impl DeviceDiscovery for MdnsDiscovery {
             crate::Error::Other(format!("Failed to create mDNS daemon: {e}"))
         })?;
 
-        let mut discovered_devices: HashMap<String, DiscoveredDevice> = HashMap::new();
-
+        // Browse all service types simultaneously
+        let mut receivers = Vec::new();
         for service_type in &self.service_types {
-            let receiver = mdns.browse(service_type).map_err(|e| {
-                crate::Error::Other(format!("Failed to browse service {service_type}: {e}"))
-            })?;
+            match mdns.browse(service_type) {
+                Ok(receiver) => receivers.push((service_type.clone(), receiver)),
+                Err(e) => {
+                    log::warn!("Failed to browse {service_type}: {e}");
+                }
+            }
+        }
 
+        let service_types = self.service_types.clone();
+        let discovered = tokio::task::spawn_blocking(move || {
+            let mut discovered_devices: HashMap<String, DiscoveredDevice> = HashMap::new();
             let deadline = std::time::Instant::now() + timeout;
 
+            // Poll all receivers until timeout
             while std::time::Instant::now() < deadline {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                // Short poll interval so we check all receivers fairly
+                let poll_time = remaining.min(Duration::from_millis(200));
+                let mut got_event = false;
 
-                let recv_result = tokio::task::spawn_blocking({
-                    let receiver = receiver.clone();
-                    move || receiver.recv_timeout(remaining)
-                })
-                .await;
-
-                match recv_result {
-                    Ok(Ok(event)) => match event {
-                        ServiceEvent::ServiceResolved(info) => {
+                for (service_type, receiver) in &receivers {
+                    match receiver.recv_timeout(poll_time) {
+                        Ok(ServiceEvent::ServiceResolved(info)) => {
+                            got_event = true;
                             let properties: HashMap<String, String> = info
                                 .get_properties()
                                 .iter()
                                 .map(|p| (p.key().to_string(), p.val_str().to_string()))
                                 .collect();
 
-                            let (device_type, product_type, os_version) =
-                                self.parse_service_properties(&properties, service_type);
+                            let device_class = properties
+                                .get("DeviceClass")
+                                .or_else(|| properties.get("deviceClass"))
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+
+                            let device_type = if !device_class.is_empty() {
+                                DeviceType::from_device_class(device_class)
+                            } else if let Some(pt) = properties.get("ProductType") {
+                                DeviceType::from_product_type(pt)
+                            } else {
+                                DeviceType::Unknown
+                            };
+
+                            let product_type = properties
+                                .get("ProductType")
+                                .or_else(|| properties.get("model"))
+                                .cloned();
+                            let os_version = properties
+                                .get("OSVersion")
+                                .or_else(|| properties.get("osVersion"))
+                                .cloned();
 
                             let hostname = info.get_hostname();
                             let name = {
-                                let friendly_name = hostname
+                                let friendly = hostname
                                     .trim_end_matches('.')
                                     .trim_end_matches(".local")
                                     .replace('-', " ");
-
-                                if friendly_name.is_empty() {
+                                if friendly.is_empty() {
                                     properties
                                         .get("Name")
                                         .or_else(|| properties.get("name"))
                                         .cloned()
                                         .unwrap_or_else(|| info.get_fullname().to_string())
                                 } else {
-                                    friendly_name
+                                    friendly
                                 }
                             };
 
@@ -122,7 +115,6 @@ impl DeviceDiscovery for MdnsDiscovery {
                             let ip_address =
                                 addresses.iter().next().map(|addr| addr.to_string());
                             let port = Some(info.get_port());
-
                             let is_paired = service_type.contains("mobdev2");
 
                             let key = hostname
@@ -130,30 +122,45 @@ impl DeviceDiscovery for MdnsDiscovery {
                                 .trim_end_matches(".local")
                                 .to_string();
 
-                            let device = DiscoveredDevice {
-                                name,
-                                udid,
-                                ip_address,
-                                port,
-                                device_type,
-                                connection_type: ConnectionType::WiFi,
-                                is_paired,
-                                product_type,
-                                os_version,
-                            };
-
-                            discovered_devices.insert(key, device);
+                            discovered_devices.insert(
+                                key,
+                                DiscoveredDevice {
+                                    name,
+                                    udid,
+                                    ip_address,
+                                    port,
+                                    device_type,
+                                    connection_type: ConnectionType::WiFi,
+                                    is_paired,
+                                    product_type,
+                                    os_version,
+                                },
+                            );
                         }
-                        ServiceEvent::SearchStopped(_) => break,
-                        _ => {}
-                    },
-                    Ok(Err(_)) => break,
-                    Err(_) => break,
+                        Ok(_) => {
+                            got_event = true;
+                        }
+                        Err(_) => {} // timeout on this receiver, try next
+                    }
+                }
+
+                if !got_event && poll_time == remaining {
+                    break; // final poll expired with no events
                 }
             }
-        }
 
-        Ok(discovered_devices.into_values().collect())
+            // Stop all browses before dropping to avoid "closed channel" errors
+            for stype in &service_types {
+                let _ = mdns.stop_browse(stype);
+            }
+            let _ = mdns.shutdown();
+
+            discovered_devices
+        })
+        .await
+        .map_err(|e| crate::Error::Other(format!("mDNS scan task failed: {e}")))?;
+
+        Ok(discovered.into_values().collect())
     }
 }
 
