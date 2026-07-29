@@ -454,7 +454,7 @@ impl Device {
                 .await
                 .map_err(|e| Error::Other(format!("TLS tunnel connect failed: {e}")))?;
 
-            connect_tls_psk_tunnel_native(tunnel_stream, rpc.encryption_key())
+            connect_tls_psk_tunnel_native(Box::new(tunnel_stream), rpc.encryption_key())
                 .await
                 .map_err(|e| Error::Other(format!("TLS-PSK tunnel handshake failed: {e}")))?
         };
