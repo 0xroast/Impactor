@@ -128,6 +128,17 @@ impl TvOsPairingScreen {
         })
     }
 
+    /// Identity a device's cached pairing file is stored under.
+    ///
+    /// It cannot be the advertised `identifier`: the two RPPairing service types report
+    /// different identifiers for the same Apple TV, and a paired device stops advertising
+    /// manual pairing altogether, so a file written under the manual-pairing identifier could
+    /// never be found again. The name derives from the host name and is the same under every
+    /// service type, which is what makes a pairing survive to the next connection.
+    fn pairing_identity(name: &str) -> String {
+        name.replace(' ', "-")
+    }
+
     /// The standard (already-paired) service entry for the selected device, if known.
     fn reconnect_entry(&self) -> Option<&DiscoveredDevice> {
         let name = self.selected_name.as_deref()?;
@@ -246,10 +257,7 @@ impl TvOsPairingScreen {
                 let reconnect_port = self.reconnect_entry().and_then(|d| d.port);
 
                 let name = dev.name.clone();
-                let hostname = dev
-                    .udid
-                    .clone()
-                    .unwrap_or_else(|| ip_str.replace('.', "-"));
+                let hostname = Self::pairing_identity(&dev.name);
                 let cache_dir = get_data_path();
 
                 // The Apple TV shows no code until it has accepted the pair-setup request, so
@@ -367,9 +375,9 @@ impl TvOsPairingScreen {
                 self.pin_sender = None;
                 match result {
                     Ok(_) => {
-                        // Reconstruct paired device info from the discovered entries. Prefer
-                        // the reconnect service's ip/udid if present (same device, same udid,
-                        // but this keeps things consistent if only one entry resolved).
+                        // Reconstruct paired device info from the discovered entries. Either
+                        // entry supplies the same address; the identity must come from the name
+                        // rather than the advertised identifier, which differs per service type.
                         let manual = self.manual_pairing_entry().cloned();
                         let reconnect = self.reconnect_entry().cloned();
                         if let Some(dev) = reconnect.as_ref().or(manual.as_ref()) {
@@ -377,10 +385,7 @@ impl TvOsPairingScreen {
                                 if let Ok(ip) = ip_str.parse() {
                                     self.paired_device = Some(PairedDevice {
                                         name: dev.name.clone(),
-                                        hostname: dev
-                                            .udid
-                                            .clone()
-                                            .unwrap_or_else(|| ip_str.replace('.', "-")),
+                                        hostname: Self::pairing_identity(&dev.name),
                                         ip,
                                         pairing_port: manual.as_ref().and_then(|d| d.port),
                                         reconnect_port: reconnect.as_ref().and_then(|d| d.port),
