@@ -3,6 +3,15 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Service for devices with no existing pairing, actively showing a pairing PIN on screen.
+/// This is the only service that supports first-time SRP pair-setup.
+pub const REMOTEPAIRING_MANUAL_PAIRING_SERVICE: &str = "_remotepairing-manual-pairing._tcp.local.";
+/// Service for devices with an existing pairing. Reconnect (pair-verify) only - does not
+/// support first-time pairing.
+pub const REMOTEPAIRING_SERVICE: &str = "_remotepairing._tcp.local.";
+const APPLE_MOBDEV2_SERVICE: &str = "_apple-mobdev2._tcp.local.";
+const APPLE_PAIRABLE_SERVICE: &str = "_apple-pairable._tcp.local.";
+
 pub struct MdnsDiscovery {
     service_types: Vec<String>,
 }
@@ -11,10 +20,10 @@ impl MdnsDiscovery {
     pub fn new() -> Self {
         Self {
             service_types: vec![
-                "_apple-mobdev2._tcp.local.".to_string(),
-                "_apple-pairable._tcp.local.".to_string(),
-                "_remotepairing._tcp.local.".to_string(),
-                "_remotepairing-manual-pairing._tcp.local.".to_string(),
+                APPLE_MOBDEV2_SERVICE.to_string(),
+                APPLE_PAIRABLE_SERVICE.to_string(),
+                REMOTEPAIRING_SERVICE.to_string(),
+                REMOTEPAIRING_MANUAL_PAIRING_SERVICE.to_string(),
             ],
         }
     }
@@ -45,7 +54,11 @@ impl DeviceDiscovery for MdnsDiscovery {
 
         let service_types = self.service_types.clone();
         let discovered = tokio::task::spawn_blocking(move || {
-            let mut discovered_devices: HashMap<String, DiscoveredDevice> = HashMap::new();
+            // Keyed by (hostname, service_type): the same physical device can advertise
+            // multiple RPPairing service types at once with different ports (e.g. manual
+            // pairing vs. an already-established pairing), and those are not interchangeable.
+            let mut discovered_devices: HashMap<(String, String), DiscoveredDevice> =
+                HashMap::new();
             let deadline = std::time::Instant::now() + timeout;
 
             // Poll all receivers until timeout
@@ -117,10 +130,21 @@ impl DeviceDiscovery for MdnsDiscovery {
                             let port = Some(info.get_port());
                             let is_paired = service_type.contains("mobdev2");
 
-                            let key = hostname
-                                .trim_end_matches('.')
-                                .trim_end_matches(".local")
-                                .to_string();
+                            log::debug!(
+                                "mDNS resolved: hostname={} service={} ip={:?} port={:?}",
+                                hostname,
+                                service_type,
+                                ip_address,
+                                port
+                            );
+
+                            let key = (
+                                hostname
+                                    .trim_end_matches('.')
+                                    .trim_end_matches(".local")
+                                    .to_string(),
+                                service_type.clone(),
+                            );
 
                             discovered_devices.insert(
                                 key,
@@ -134,6 +158,7 @@ impl DeviceDiscovery for MdnsDiscovery {
                                     is_paired,
                                     product_type,
                                     os_version,
+                                    service_type: service_type.clone(),
                                 },
                             );
                         }

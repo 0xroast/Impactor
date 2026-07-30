@@ -2,7 +2,9 @@ use iced::widget::{
     button, column, container, pick_list, progress_bar, row, rule, scrollable, text, text_input,
 };
 use iced::{Center, Color, Element, Fill, Task};
-use plume_utils::discovery::mdns::MdnsDiscovery;
+use plume_utils::discovery::mdns::{
+    MdnsDiscovery, REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE,
+};
 use plume_utils::discovery::{DeviceDiscovery, DeviceType, DiscoveredDevice};
 use plume_utils::Device;
 use std::time::Duration;
@@ -64,7 +66,10 @@ struct PairedDevice {
     name: String,
     hostname: String,
     ip: std::net::IpAddr,
-    port: u16,
+    /// `_remotepairing-manual-pairing._tcp.local.` port, if still known.
+    pairing_port: Option<u16>,
+    /// `_remotepairing._tcp.local.` port, if known - preferred for reconnecting.
+    reconnect_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,9 +100,21 @@ impl TvOsPairingScreen {
         }
     }
 
-    fn selected_device(&self) -> Option<&DiscoveredDevice> {
+    /// The manual-pairing service entry for the selected device, if the Apple TV is currently
+    /// advertising it (i.e. actively showing a pairing PIN). Required to start a new pairing.
+    fn manual_pairing_entry(&self) -> Option<&DiscoveredDevice> {
         let name = self.selected_name.as_deref()?;
-        self.discovered.iter().find(|d| d.name == name)
+        self.discovered
+            .iter()
+            .find(|d| d.name == name && d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE)
+    }
+
+    /// The standard (already-paired) service entry for the selected device, if known.
+    fn reconnect_entry(&self) -> Option<&DiscoveredDevice> {
+        let name = self.selected_name.as_deref()?;
+        self.discovered
+            .iter()
+            .find(|d| d.name == name && d.service_type == REMOTEPAIRING_SERVICE)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -171,7 +188,12 @@ impl TvOsPairingScreen {
             }
 
             Message::Pair => {
-                let Some(dev) = self.selected_device() else {
+                let Some(dev) = self.manual_pairing_entry() else {
+                    self.status = Some(StatusMessage::error(
+                        "This Apple TV isn't showing a pairing PIN. On the Apple TV, open \
+                         Settings > Remotes and Devices > Remote App and Devices, wait for \
+                         \"Waiting to Pair...\", then Scan again.",
+                    ));
                     return Task::none();
                 };
                 if self.pin.len() != 6 {
@@ -186,13 +208,14 @@ impl TvOsPairingScreen {
                         return Task::none();
                     }
                 };
-                let port = match dev.port {
+                let pairing_port = match dev.port {
                     Some(p) => p,
                     None => {
                         self.status = Some(StatusMessage::error("Selected device has no port."));
                         return Task::none();
                     }
                 };
+                let reconnect_port = self.reconnect_entry().and_then(|d| d.port);
 
                 let name = dev.name.clone();
                 let hostname = dev
@@ -205,13 +228,6 @@ impl TvOsPairingScreen {
                 self.pairing = true;
                 self.status = Some(StatusMessage::info("Pairing..."));
 
-                let paired_info = PairedDevice {
-                    name: name.clone(),
-                    hostname: hostname.clone(),
-                    ip: ip_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                    port,
-                };
-
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -219,36 +235,32 @@ impl TvOsPairingScreen {
                         let ip: std::net::IpAddr = ip_str
                             .parse()
                             .map_err(|e| format!("Invalid IP: {e}"))?;
-                        let device = Device::new_tvos(name, hostname, ip, port);
+                        let device = Device::new_tvos(
+                            name,
+                            hostname,
+                            ip,
+                            Some(pairing_port),
+                            reconnect_port,
+                        );
                         device
                             .pair_tvos(pin, cache_dir)
                             .await
                             .map(|_| ())
                             .map_err(|e| format!("{e}"))
                     });
-                    let _ = tx.send((result, paired_info));
+                    let _ = tx.send(result);
                 });
 
                 Task::perform(
                     async move {
                         std::thread::spawn(move || {
                             rx.recv()
-                                .unwrap_or_else(|_| (Err("Pairing thread error".to_string()), PairedDevice {
-                                    name: String::new(),
-                                    hostname: String::new(),
-                                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                                    port: 0,
-                                }))
+                                .unwrap_or_else(|_| Err("Pairing thread error".to_string()))
                         })
                         .join()
                         .unwrap()
                     },
-                    |(result, _info)| {
-                        match result {
-                            Ok(()) => Message::PairComplete(Ok(())),
-                            Err(e) => Message::PairComplete(Err(e)),
-                        }
-                    },
+                    Message::PairComplete,
                 )
             }
 
@@ -256,15 +268,23 @@ impl TvOsPairingScreen {
                 self.pairing = false;
                 match result {
                     Ok(_) => {
-                        // Reconstruct paired device info from the selected device
-                        if let Some(dev) = self.selected_device() {
-                            if let (Some(ip_str), Some(port)) = (&dev.ip_address, dev.port) {
+                        // Reconstruct paired device info from the discovered entries. Prefer
+                        // the reconnect service's ip/udid if present (same device, same udid,
+                        // but this keeps things consistent if only one entry resolved).
+                        let manual = self.manual_pairing_entry().cloned();
+                        let reconnect = self.reconnect_entry().cloned();
+                        if let Some(dev) = reconnect.as_ref().or(manual.as_ref()) {
+                            if let Some(ip_str) = &dev.ip_address {
                                 if let Ok(ip) = ip_str.parse() {
                                     self.paired_device = Some(PairedDevice {
                                         name: dev.name.clone(),
-                                        hostname: dev.udid.clone().unwrap_or_else(|| ip_str.replace('.', "-")),
+                                        hostname: dev
+                                            .udid
+                                            .clone()
+                                            .unwrap_or_else(|| ip_str.replace('.', "-")),
                                         ip,
-                                        port,
+                                        pairing_port: manual.as_ref().and_then(|d| d.port),
+                                        reconnect_port: reconnect.as_ref().and_then(|d| d.port),
                                     });
                                 }
                             }
@@ -309,7 +329,8 @@ impl TvOsPairingScreen {
                 let name = paired.name.clone();
                 let hostname = paired.hostname.clone();
                 let ip = paired.ip;
-                let port = paired.port;
+                let pairing_port = paired.pairing_port;
+                let reconnect_port = paired.reconnect_port;
                 let ipa = ipa_path.clone();
                 let pin = self.pin.clone();
                 let cache_dir = get_data_path();
@@ -321,7 +342,8 @@ impl TvOsPairingScreen {
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let result = rt.block_on(async move {
-                        let device = Device::new_tvos(name, hostname, ip, port);
+                        let device =
+                            Device::new_tvos(name, hostname, ip, pairing_port, reconnect_port);
                         device
                             .install_app_tvos(&ipa, pin, cache_dir)
                             .await
@@ -390,8 +412,13 @@ impl TvOsPairingScreen {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
 
-            let device_names: Vec<String> =
+            // A device can appear twice (once per RPPairing service type it advertises) -
+            // dedupe by name for the picker; the specific service entries are looked up by
+            // name when needed.
+            let mut device_names: Vec<String> =
                 self.discovered.iter().map(|d| d.name.clone()).collect();
+            device_names.sort();
+            device_names.dedup();
             let selected = self.selected_name.clone();
 
             content = content.push(

@@ -48,8 +48,13 @@ pub struct Device {
     // On x86_64 macs, `is_mac` variable should never be true
     // since its only true if the device is added manually.
     pub is_mac: bool,
-    /// IP address and port for network-only Apple TV devices (no USB).
-    pub network_address: Option<(std::net::IpAddr, u16)>,
+    /// Address of the `_remotepairing-manual-pairing._tcp.local.` service, advertised only
+    /// while the Apple TV is actively showing a pairing PIN. Required for first-time pairing;
+    /// not valid once the pairing UI is dismissed.
+    pub pairing_address: Option<(std::net::IpAddr, u16)>,
+    /// Address of the `_remotepairing._tcp.local.` service, advertised whenever the Apple TV
+    /// has an established pairing. Used to reconnect (pair-verify) after the initial pairing.
+    pub reconnect_address: Option<(std::net::IpAddr, u16)>,
 }
 
 impl Device {
@@ -64,20 +69,33 @@ impl Device {
             device_id: usbmuxd_device.device_id.clone(),
             usbmuxd_device: Some(usbmuxd_device),
             is_mac: false,
-            network_address: None,
+            pairing_address: None,
+            reconnect_address: None,
         }
     }
 
     /// Create a Device representing a network Apple TV (no USB connection).
     /// `hostname` is used as the stable identifier (e.g. "Apple-TV.local").
-    pub fn new_tvos(name: String, hostname: String, ip: std::net::IpAddr, port: u16) -> Self {
+    ///
+    /// `pairing_address` should come from `_remotepairing-manual-pairing._tcp.local.` and is
+    /// required for `pair_tvos()`. `reconnect_address` should come from
+    /// `_remotepairing._tcp.local.` and is preferred by `establish_tvos_tunnel()` once a device
+    /// is already paired; when absent, `pairing_address` is used as a fallback.
+    pub fn new_tvos(
+        name: String,
+        hostname: String,
+        ip: std::net::IpAddr,
+        pairing_port: Option<u16>,
+        reconnect_port: Option<u16>,
+    ) -> Self {
         Device {
             name,
             udid: hostname,
             device_id: 0,
             usbmuxd_device: None,
             is_mac: false,
-            network_address: Some((ip, port)),
+            pairing_address: pairing_port.map(|port| (ip, port)),
+            reconnect_address: reconnect_port.map(|port| (ip, port)),
         }
     }
 
@@ -345,13 +363,20 @@ impl Device {
     }
 
     /// Pair with a network Apple TV (tvOS 17.4+) using the RPPairing binary protocol.
-    /// Discovers the device via mDNS `_remotepairing._tcp.local.` then connects directly
-    /// over TCP. `pin` is the 6-digit code shown on the Apple TV screen.
+    /// Connects to the mDNS `_remotepairing-manual-pairing._tcp.local.` service - the only
+    /// service that accepts a first-time SRP pair-setup - which is advertised only while the
+    /// Apple TV is actively showing a pairing PIN (Settings > Remotes and Devices > Remote App
+    /// and Devices). `pin` is the 6-digit code shown on the Apple TV screen.
     /// The resulting pairing file is cached at `cache_dir/plume_<hostname>.plist`.
     pub async fn pair_tvos(&self, pin: String, cache_dir: PathBuf) -> Result<RpPairingFile, Error> {
-        let (ip, port) = self
-            .network_address
-            .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
+        let (ip, port) = self.pairing_address.ok_or_else(|| {
+            Error::Other(
+                "Device is not advertising the pairing service. On the Apple TV, open Settings \
+                 > Remotes and Devices > Remote App and Devices and wait for \"Waiting to \
+                 Pair...\", then scan again."
+                    .to_string(),
+            )
+        })?;
 
         let cache_path = cache_dir.join(format!("plume_{}.plist", self.udid));
 
@@ -395,16 +420,20 @@ impl Device {
     /// Establish a TLS-PSK tunnel to a paired Apple TV and discover RSD services.
     /// This is the post-pairing step that gives access to InstallationProxy, AFC, etc.
     ///
-    /// `pin` is needed because the RPPairing path runs a full `connect` (SRP exchange)
-    /// even for existing pairing files. For re-connections where the user already paired,
-    /// pass the same PIN or the device may prompt again.
+    /// Prefers `reconnect_address` (`_remotepairing._tcp.local.`), which is what a paired
+    /// device keeps advertising and only needs a pair-verify against - no PIN required in the
+    /// common case. Falls back to `pairing_address` if no reconnect address is known (e.g.
+    /// installing immediately after pairing, in the same scan, before a reconnect address has
+    /// been observed). `pin` is only actually used if pair-verify fails and the client falls
+    /// back to a full SRP pair-setup.
     pub async fn establish_tvos_tunnel(
         &self,
         pin: String,
         cache_dir: PathBuf,
     ) -> Result<(AdapterHandle, RsdHandshake), Error> {
         let (ip, port) = self
-            .network_address
+            .reconnect_address
+            .or(self.pairing_address)
             .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
 
         let connect_addr = std::net::SocketAddr::new(ip, port);
@@ -589,7 +618,7 @@ fn get_app_name_from_info(info: &Value) -> Option<String> {
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let conn = if self.network_address.is_some() {
+        let conn = if self.pairing_address.is_some() || self.reconnect_address.is_some() {
             "WiFi (tvOS)"
         } else {
             match &self.usbmuxd_device {

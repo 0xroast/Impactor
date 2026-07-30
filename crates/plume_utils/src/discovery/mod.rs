@@ -75,6 +75,12 @@ pub struct DiscoveredDevice {
     pub is_paired: bool,
     pub product_type: Option<String>,
     pub os_version: Option<String>,
+    /// The mDNS service type this entry was resolved from (e.g.
+    /// `_remotepairing-manual-pairing._tcp.local.`). Devices advertise different RPPairing
+    /// services depending on whether they're actively showing a pairing PIN or already paired,
+    /// and those services listen on different ports - callers must not treat entries from
+    /// different service types as interchangeable.
+    pub service_type: String,
 }
 
 #[allow(async_fn_in_trait)]
