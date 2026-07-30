@@ -220,6 +220,17 @@ impl Device {
         Ok(cache_dir.join(format!("plume_{key}.plist")))
     }
 
+    /// True when this device is an Apple TV, which the developer portal must be told about
+    /// explicitly because its requests default to iOS.
+    ///
+    /// A network-paired device (one with a `pairing_identity`) is the only case this recognizes;
+    /// a USB-attached Apple TV is not currently distinguished from a USB-attached iOS device and
+    /// is treated as iOS. That gap is out of scope here: USB Apple TV support does not exist yet
+    /// in this codebase, so there is no USB device to misclassify in practice.
+    pub fn is_tvos(&self) -> bool {
+        self.pairing_identity.is_some()
+    }
+
     async fn get_name_from_usbmuxd_device(device: &UsbmuxdDevice) -> Result<String, Error> {
         let mut lockdown =
             LockdownClient::connect(&device.to_provider(UsbmuxdAddr::default(), CONNECTION_LABEL))
@@ -1121,6 +1132,31 @@ mod tests {
         };
         device.apply_tvos_info(&info);
         assert_eq!(device.udid, "EXISTING-UDID");
+    }
+
+    #[test]
+    fn is_tvos_true_for_network_paired_device() {
+        let device = stub_tvos_device();
+        assert!(device.is_tvos());
+    }
+
+    #[test]
+    fn is_tvos_false_for_usb_device() {
+        let device = stub_device();
+        assert!(!device.is_tvos());
+    }
+
+    #[test]
+    fn new_tvos_device_reports_is_tvos() {
+        let d = Device::new_tvos(
+            "Apple TV".to_string(),
+            "Apple-TV".to_string(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(1234),
+            None,
+            std::env::temp_dir(),
+        );
+        assert!(d.is_tvos());
     }
 
     #[test]

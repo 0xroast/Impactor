@@ -445,13 +445,20 @@ pub(crate) async fn run_installation(
     mut store: Option<&mut plume_store::AccountStore>,
     tx: &std::sync::mpsc::Sender<(String, i32)>,
 ) -> Result<(), String> {
-    use plume_core::{AnisetteConfiguration, CertificateIdentity, developer::DeveloperSession};
+    use plume_core::{
+        AnisetteConfiguration, CertificateIdentity,
+        developer::{DeveloperPlatform, DeveloperSession},
+    };
     use plume_utils::{Signer, SignerInstallMode, SignerMode};
 
     let package_file: Bundle;
     let mut options = options.clone();
     let send = |msg: String, progress: i32| {
         let _ = tx.send((msg, progress));
+    };
+    let platform = match device {
+        Some(dev) if dev.is_tvos() => DeveloperPlatform::TvOs,
+        _ => DeveloperPlatform::IOs,
     };
 
     send("Preparing package...".to_string(), 10);
@@ -525,7 +532,7 @@ pub(crate) async fn run_installation(
 
             if let Some(dev) = &device {
                 session
-                    .qh_ensure_device(team_id, &dev.name, &dev.udid)
+                    .qh_ensure_device(team_id, &dev.name, &dev.udid, platform)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -543,7 +550,7 @@ pub(crate) async fn run_installation(
                 .await
                 .map_err(|e| e.to_string())?;
             signer
-                .register_bundle(&bundle, &session, team_id, false)
+                .register_bundle(&bundle, &session, team_id, false, platform)
                 .await
                 .map_err(|e| e.to_string())?;
             signer
