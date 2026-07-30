@@ -39,11 +39,19 @@ async fn live_tunnel() {
         );
     }
 
+    // A paired Apple TV that is not on its pairing screen advertises only the reconnect
+    // service, whose TXT record carries no model, so it types as Unknown. Selecting on the
+    // service type rather than the device type is what finds it in that state.
     let tv_name = devices
         .iter()
         .find(|d| d.device_type == DeviceType::AppleTV)
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|d| d.service_type == REMOTEPAIRING_SERVICE)
+        })
         .map(|d| d.name.clone())
-        .expect("no Apple TV found");
+        .expect("no device advertising an RPPairing service found");
 
     let entry_for = |service: &str| {
         devices
@@ -91,6 +99,17 @@ async fn live_tunnel() {
     match device.establish_tvos_tunnel(String::new(), cache_dir).await {
         Ok((_adapter, handshake)) => {
             println!("TUNNEL ESTABLISHED");
+            println!("rsd uuid: {}", handshake.uuid);
+            // Signing registers a device with Apple by its real UDID, which mDNS does not
+            // advertise, so whether these properties carry one decides whether a network Apple
+            // TV can go through the normal signing pipeline at all.
+            println!("--- RSD properties ({}) ---", handshake.properties.len());
+            let mut props: Vec<_> = handshake.properties.iter().collect();
+            props.sort_by_key(|(k, _)| k.to_string());
+            for (k, v) in props {
+                println!("  {k} = {v:?}");
+            }
+            println!("--- end properties ---");
             let mut names: Vec<_> = handshake.services.keys().cloned().collect();
             names.sort();
             println!("{} RSD services discovered:", names.len());
