@@ -93,10 +93,11 @@ async fn live_tunnel() {
         ip,
         manual.and_then(|d| d.port),
         reconnect.and_then(|d| d.port),
+        cache_dir.clone(),
     );
 
     println!("\nestablishing tunnel...");
-    match device.establish_tvos_tunnel(String::new(), cache_dir).await {
+    match device.establish_tvos_tunnel(cache_dir).await {
         Ok((_adapter, handshake)) => {
             println!("TUNNEL ESTABLISHED");
             println!("rsd uuid: {}", handshake.uuid);

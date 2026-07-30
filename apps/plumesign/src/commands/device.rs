@@ -59,6 +59,7 @@ pub async fn execute(args: DeviceArgs) -> Result<()> {
                     pairing_address: None,
                     reconnect_address: None,
                     pairing_identity: None,
+                    pairing_cache_dir: None,
                 }
             } else {
                 select_device(args.udid).await?

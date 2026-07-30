@@ -78,6 +78,7 @@ async fn live_pair() {
         ip,
         Some(port),
         None,
+        cache_dir.clone(),
     );
 
     let provider = || {

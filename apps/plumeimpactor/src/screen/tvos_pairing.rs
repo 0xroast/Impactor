@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, column, container, pick_list, progress_bar, row, rule, scrollable, text, text_input,
+    button, column, container, pick_list, row, rule, scrollable, text, text_input,
 };
 use iced::futures::StreamExt;
 use iced::{Center, Color, Element, Fill, Task};
@@ -295,6 +295,7 @@ impl TvOsPairingScreen {
                             ip,
                             Some(pairing_port),
                             reconnect_port,
+                            cache_dir.clone(),
                         );
                         device
                             .pair_tvos(
@@ -446,7 +447,6 @@ impl TvOsPairingScreen {
                 let pairing_port = paired.pairing_port;
                 let reconnect_port = paired.reconnect_port;
                 let ipa = ipa_path.clone();
-                let pin = self.pin.clone();
                 let cache_dir = get_data_path();
 
                 self.installing = true;
@@ -456,10 +456,16 @@ impl TvOsPairingScreen {
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let result = rt.block_on(async move {
-                        let device =
-                            Device::new_tvos(name, hostname, ip, pairing_port, reconnect_port);
+                        let device = Device::new_tvos(
+                            name,
+                            hostname,
+                            ip,
+                            pairing_port,
+                            reconnect_port,
+                            cache_dir,
+                        );
                         device
-                            .install_app_tvos(&ipa, pin, cache_dir)
+                            .install_app(&ipa, |_progress: i32| async {})
                             .await
                             .map_err(|e| format!("{e}"))
                     });
@@ -650,10 +656,6 @@ impl TvOsPairingScreen {
                     .style(appearance::p_button)
                     .width(Fill),
             );
-        }
-
-        if self.installing {
-            content = content.push(progress_bar(0.0..=1.0, 0.5));
         }
 
         content = content

@@ -14,7 +14,7 @@ use idevice::tcp::adapter::Adapter;
 use idevice::tcp::handle::AdapterHandle;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdDevice};
 use idevice::utils::installation;
-use idevice::{IdeviceService, RsdService, RemoteXpcClient};
+use idevice::{IdeviceService, RemoteXpcClient};
 use plume_core::MobileProvision;
 
 use crate::Error;
@@ -59,6 +59,9 @@ pub struct Device {
     /// `None` for USB devices, which are keyed by `udid`. Deliberately not the mDNS-advertised
     /// identifier, which changes between advertisements of the same device.
     pub pairing_identity: Option<String>,
+    /// Directory holding this device's cached pairing file. Set for network devices, whose
+    /// install path must re-establish a tunnel; `None` for USB devices, which need no pairing file.
+    pub pairing_cache_dir: Option<PathBuf>,
 }
 
 /// A network Apple TV's real identity, as reported by the device itself over an RSD handshake
@@ -110,6 +113,7 @@ impl Device {
             pairing_address: None,
             reconnect_address: None,
             pairing_identity: None,
+            pairing_cache_dir: None,
         }
     }
 
@@ -125,12 +129,17 @@ impl Device {
     /// required for `pair_tvos()`. `reconnect_address` should come from
     /// `_remotepairing._tcp.local.` and is preferred by `establish_tvos_tunnel()` once a device
     /// is already paired; when absent, `pairing_address` is used as a fallback.
+    ///
+    /// `cache_dir` is the directory this device's pairing file lives (or will be cached) under;
+    /// it is stored on the device so `install_app()` can re-establish a tunnel without the
+    /// transport-agnostic caller having to know a cache directory even exists.
     pub fn new_tvos(
         name: String,
         pairing_identity: String,
         ip: std::net::IpAddr,
         pairing_port: Option<u16>,
         reconnect_port: Option<u16>,
+        cache_dir: PathBuf,
     ) -> Self {
         Device {
             name,
@@ -141,6 +150,7 @@ impl Device {
             pairing_address: pairing_port.map(|port| (ip, port)),
             reconnect_address: reconnect_port.map(|port| (ip, port)),
             pairing_identity: Some(pairing_identity),
+            pairing_cache_dir: Some(cache_dir),
         }
     }
 
@@ -445,6 +455,13 @@ impl Device {
     /// Apple TV is actively showing a pairing PIN (Settings > Remotes and Devices > Remote App
     /// and Devices). `pin` is the 6-digit code shown on the Apple TV screen.
     /// The resulting pairing file is cached at `cache_dir/plume_<hostname>.plist`.
+    ///
+    /// Always contacts the device, even when a cached pairing file already exists: a cached
+    /// file that still verifies produces a silent pair-verify with `pin_provider` never called,
+    /// while a stale one (device reset, "Forget This Device", tvOS update) is transparently
+    /// replaced by a real pair-setup. This is why calling this again is the correct way to
+    /// recover from a pairing that `establish_tvos_tunnel` found to be stale.
+    ///
     /// `pin_provider` is invoked only once the device has accepted the pair-setup request, which
     /// is the moment its PIN appears on screen. Taking a provider rather than a string is what
     /// lets a caller prompt for the code at that point: the code does not exist before then, and
@@ -469,10 +486,6 @@ impl Device {
 
         let cache_path = self.pairing_cache_path(&cache_dir)?;
 
-        if cache_path.exists() {
-            return Ok(RpPairingFile::read_from_file(&cache_path).await?);
-        }
-
         let addr = std::net::SocketAddr::new(ip, port);
         log::info!("tvOS pairing: connecting to {addr}");
         let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
@@ -486,16 +499,31 @@ impl Device {
 
         let conn = RpPairingSocket::new(stream);
 
-        let suffix: String = uuid::Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(6)
-            .collect();
-        let hostname = format!("plume-{suffix}");
+        // A cached pairing file is loaded (rather than always generating fresh) so that
+        // `connect()` below can pair-verify against it: an already-valid pairing succeeds at
+        // verification and never invokes the PIN provider at all, while a stale one (device
+        // reset, "Forget This Device", tvOS update) falls through to a real pair-setup that
+        // does invoke it. This is what makes pressing Pair on a healthy pairing silent.
+        // `sending_host` is only a label: it travels as the `sendingHost`/`name` field and is what
+        // the Apple TV lists this host as, while the pairing identity is the file's `identifier`
+        // and its Ed25519 keys. A fresh pairing therefore uses a readable name, and
+        // `RpPairingFile::generate` derives the identifier from it.
+        let (mut pairing_file, sending_host) = if cache_path.exists() {
+            let file = RpPairingFile::read_from_file(&cache_path).await?;
+            let host = file.identifier.clone();
+            (file, host)
+        } else {
+            let suffix: String = uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(6)
+                .collect();
+            let host = format!("plume-{suffix}");
+            (RpPairingFile::generate(&host), host)
+        };
 
-        let mut pairing_file = RpPairingFile::generate(&hostname);
-        let mut pairing_client = RemotePairingClient::new(conn, &hostname, &mut pairing_file);
+        let mut pairing_client = RemotePairingClient::new(conn, &sending_host, &mut pairing_file);
         pairing_client
             .connect(
                 move |_: u8| {
@@ -514,18 +542,23 @@ impl Device {
         Ok(pairing_file)
     }
 
-    /// Establish a TLS-PSK tunnel to a paired Apple TV and discover RSD services.
+    /// Establish a TLS-PSK tunnel to an already-paired Apple TV and discover RSD services.
     /// This is the post-pairing step that gives access to InstallationProxy, AFC, etc.
     ///
+    /// Verify-only: this pair-verifies against the cached pairing file and never performs a
+    /// fresh SRP pair-setup, so it can never make the Apple TV display a pairing code - unlike
+    /// `pair_tvos()`, which is the only place that may do that. If the cached pairing file is
+    /// no longer valid (device factory reset, "Forget This Device", or a tvOS update that broke
+    /// the pairing - the last of which the Apple TV routinely does after a system update), this
+    /// call fails and deletes the stale cache file so the next `pair_tvos()` call re-pairs
+    /// instead of hitting the same failure again.
+    ///
     /// Prefers `reconnect_address` (`_remotepairing._tcp.local.`), which is what a paired
-    /// device keeps advertising and only needs a pair-verify against - no PIN required in the
-    /// common case. Falls back to `pairing_address` if no reconnect address is known (e.g.
-    /// installing immediately after pairing, in the same scan, before a reconnect address has
-    /// been observed). `pin` is only actually used if pair-verify fails and the client falls
-    /// back to a full SRP pair-setup.
+    /// device keeps advertising. Falls back to `pairing_address` if no reconnect address is
+    /// known (e.g. installing immediately after pairing, in the same scan, before a reconnect
+    /// address has been observed).
     pub async fn establish_tvos_tunnel(
         &self,
-        pin: String,
         cache_dir: PathBuf,
     ) -> Result<(AdapterHandle, RsdHandshake), Error> {
         let (ip, port) = self
@@ -560,15 +593,25 @@ impl Device {
         let hostname = pairing_file.identifier.clone();
         let tunnel = {
             let mut rpc = RemotePairingClient::new(conn, &hostname, &mut pairing_file);
-            rpc.connect(
-                move |_: u8| {
-                    let p = pin.clone();
-                    async move { p }
-                },
-                0u8,
-            )
-            .await
-            .map_err(|e| Error::Other(format!("Pairing/verification failed: {e}")))?;
+
+            rpc.attempt_pair_verify()
+                .await
+                .map_err(|e| Error::Other(format!("Pair-verify failed: {e}")))?;
+
+            if let Err(e) = rpc.validate_pairing().await {
+                if cache_path.exists() {
+                    log::warn!(
+                        "tvOS tunnel: cached pairing file at {} no longer verifies ({e}); \
+                         removing it",
+                        cache_path.display()
+                    );
+                    let _ = tokio::fs::remove_file(&cache_path).await;
+                }
+                return Err(Error::Other(format!(
+                    "This Apple TV no longer recognizes this pairing (it may have been reset, \
+                     forgotten, or lost pairing after a system update); pair with it again: {e}"
+                )));
+            }
 
             let tunnel_port = rpc
                 .create_tcp_listener()
@@ -625,10 +668,9 @@ impl Device {
     /// not to keep a connection open.
     ///
     /// Requires an existing cached pairing file and fails before touching the network if there
-    /// is none. Without this check, `establish_tvos_tunnel` would fall back to a full SRP
-    /// pair-setup against an unpaired device, which can put the Apple TV into "Waiting to Pair"
-    /// and show a code the caller never asked for - unacceptable for what is meant to be a
-    /// read-only identity probe.
+    /// is none. `establish_tvos_tunnel` is verify-only and would fail on a missing file anyway,
+    /// but checking here first gives a specific, actionable error instead of a generic
+    /// verification failure for what is meant to be a read-only identity probe.
     pub async fn fetch_tvos_info(&self, cache_dir: PathBuf) -> Result<TvosDeviceInfo, Error> {
         let cache_path = self.pairing_cache_path(&cache_dir)?;
         if !cache_path.exists() {
@@ -639,7 +681,7 @@ impl Device {
             ));
         }
 
-        let (_adapter, handshake) = self.establish_tvos_tunnel(String::new(), cache_dir).await?;
+        let (_adapter, handshake) = self.establish_tvos_tunnel(cache_dir).await?;
         Ok(TvosDeviceInfo::from_rsd_properties(&handshake.properties))
     }
 
@@ -662,55 +704,11 @@ impl Device {
         }
     }
 
-    /// Install an IPA on a paired Apple TV over a TLS-PSK tunnel.
-    /// Establishes tunnel, uploads via AFC, installs via InstallationProxy.
-    pub async fn install_app_tvos(
-        &self,
-        app_path: &PathBuf,
-        pin: String,
-        cache_dir: PathBuf,
-    ) -> Result<(), Error> {
-        let (mut adapter, mut handshake) =
-            self.establish_tvos_tunnel(pin, cache_dir).await?;
-
-        // Upload IPA via AFC
-        let mut afc = idevice::afc::AfcClient::connect_rsd(&mut adapter, &mut handshake)
-            .await
-            .map_err(|e| Error::Other(format!("AFC connection failed: {e}")))?;
-
-        let ipa_data = tokio::fs::read(app_path).await?;
-        let staging_path = "/PublicStaging/staging.ipa";
-
-        afc.mk_dir("/PublicStaging")
-            .await
-            .ok(); // ignore if exists
-        {
-            let mut f = afc
-                .open(staging_path, AfcFopenMode::Wr)
-                .await
-                .map_err(|e| Error::Other(format!("AFC open failed: {e}")))?;
-            f.write_entire(&ipa_data)
-                .await
-                .map_err(|e| Error::Other(format!("AFC upload failed: {e}")))?;
-        } // drop FileDescriptor before reusing afc
-
-        // Install via InstallationProxy
-        let mut instproxy =
-            InstallationProxyClient::connect_rsd(&mut adapter, &mut handshake)
-                .await
-                .map_err(|e| Error::Other(format!("InstallationProxy connection failed: {e}")))?;
-
-        instproxy
-            .install(staging_path, None)
-            .await
-            .map_err(|e| Error::Other(format!("Installation failed: {e}")))?;
-
-        // Cleanup staging file
-        afc.remove(staging_path).await.ok();
-
-        Ok(())
-    }
-
+    /// Install an app on this device, whether it is reachable over USB or over a network
+    /// TLS-PSK tunnel. `app_path` may be a single file (e.g. a signed `.ipa`) or a directory
+    /// (e.g. `package_file.bundle_dir()` from the standard signing pipeline) - both transports
+    /// upload it via `idevice`'s installation helpers, which branch on `app_path` being a
+    /// directory the same way for USB and network devices.
     pub async fn install_app<F, Fut>(
         &self,
         app_path: &PathBuf,
@@ -720,26 +718,64 @@ impl Device {
         F: FnMut(i32) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        if self.usbmuxd_device.is_none() {
-            return Err(Error::Other("Device is not connected via USB".to_string()));
-        }
-
-        let provider = self.usbmuxd_device.clone().unwrap().to_provider(
-            UsbmuxdAddr::from_env_var().unwrap_or_default(),
-            INSTALLATION_LABEL,
-        );
-
         let callback = move |(progress, _): (u64, ())| {
             let mut cb = progress_callback.clone();
             async move {
                 cb(progress as i32).await;
             }
         };
-
         let state = ();
 
-        installation::install_package_with_callback(&provider, app_path, None, callback, state)
+        if self.usbmuxd_device.is_some() {
+            let provider = self.usbmuxd_device.clone().unwrap().to_provider(
+                UsbmuxdAddr::from_env_var().unwrap_or_default(),
+                INSTALLATION_LABEL,
+            );
+
+            installation::install_package_with_callback(
+                &provider, app_path, None, callback, state,
+            )
             .await?;
+        } else if self.pairing_address.is_some() || self.reconnect_address.is_some() {
+            let cache_dir = self.pairing_cache_dir.clone().ok_or_else(|| {
+                Error::Other(
+                    "Network Apple TV has no pairing_cache_dir configured on this Device; \
+                     install_app has nowhere to look for its pairing file"
+                        .to_string(),
+                )
+            })?;
+
+            // Checked up front rather than left to establish_tvos_tunnel: that call is
+            // verify-only and would fail on a missing file regardless, but checking here first
+            // gives a specific "pair before installing" error instead of a generic verification
+            // failure surfacing from deep inside the tunnel handshake.
+            let cache_path = self.pairing_cache_path(&cache_dir)?;
+            if !cache_path.exists() {
+                return Err(Error::Other(
+                    "No pairing file is cached yet for this Apple TV; pair with it before \
+                     installing"
+                        .to_string(),
+                ));
+            }
+
+            let (mut adapter, mut handshake) =
+                self.establish_tvos_tunnel(cache_dir).await?;
+
+            installation::install_package_with_callback_rsd(
+                &mut adapter,
+                &mut handshake,
+                app_path,
+                None,
+                callback,
+                state,
+            )
+            .await?;
+        } else {
+            return Err(Error::Other(
+                "Device has no USB connection and no network address; cannot install"
+                    .to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -954,9 +990,24 @@ mod tests {
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Some(1234),
             None,
+            std::env::temp_dir(),
         );
         assert!(d.udid.is_empty());
         assert_eq!(d.pairing_identity.as_deref(), Some("Apple-TV"));
+    }
+
+    #[test]
+    fn new_tvos_stores_pairing_cache_dir() {
+        let cache_dir = std::env::temp_dir().join("plume_test_new_tvos_cache_dir");
+        let d = Device::new_tvos(
+            "Apple TV".to_string(),
+            "Apple-TV".to_string(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(1234),
+            None,
+            cache_dir.clone(),
+        );
+        assert_eq!(d.pairing_cache_dir, Some(cache_dir));
     }
 
     /// Represents a USB device: keyed by `udid`, with no `pairing_identity`.
@@ -970,6 +1021,7 @@ mod tests {
             pairing_address: None,
             reconnect_address: None,
             pairing_identity: None,
+            pairing_cache_dir: None,
         }
     }
 
@@ -1067,5 +1119,93 @@ mod tests {
         device.pairing_identity = Some("../evil".to_string());
         let cache_dir = Path::new("/cache");
         assert!(device.pairing_cache_path(cache_dir).is_err());
+    }
+
+    /// Unique scratch directory under the system temp dir, not created on disk by this helper.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("plume_test_{tag}_{}", uuid::Uuid::new_v4().simple()))
+    }
+
+    async fn noop_callback(_progress: i32) {}
+
+    #[tokio::test]
+    async fn install_app_with_no_transport_names_the_missing_transport() {
+        // No usbmuxd device, no pairing_address, no reconnect_address.
+        let device = stub_device();
+
+        let err = device
+            .install_app(&PathBuf::from("nonexistent.ipa"), noop_callback)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no USB connection") && msg.contains("no network address"),
+            "expected a message naming both missing transports, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_app_network_device_without_cache_dir_returns_distinct_error() {
+        let mut device = stub_device();
+        device.reconnect_address =
+            Some((std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 49151));
+        assert!(device.pairing_cache_dir.is_none());
+
+        let err = device
+            .install_app(&PathBuf::from("nonexistent.ipa"), noop_callback)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pairing_cache_dir"),
+            "expected the missing-cache-dir error, got: {msg}"
+        );
+        // Distinct from both the no-transport error and the no-pairing-file error below.
+        assert!(!msg.contains("no USB connection"));
+        assert!(!msg.contains("No pairing file is cached"));
+    }
+
+    #[tokio::test]
+    async fn install_app_network_device_with_no_pairing_file_errors_before_tunnel() {
+        let cache_dir = unique_temp_dir("no_pairing_file");
+        std::fs::create_dir_all(&cache_dir).expect("create scratch cache dir");
+
+        let mut device = stub_device();
+        device.reconnect_address =
+            Some((std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 49151));
+        device.pairing_cache_dir = Some(cache_dir.clone());
+        // stub_device()'s udid is non-empty, so pairing_cache_path resolves under cache_dir,
+        // which is empty here - no pairing file exists there.
+
+        let err = device
+            .install_app(&PathBuf::from("nonexistent.ipa"), noop_callback)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        // This is what actually catches the guard being deleted: install_app's own
+        // "no cached pairing file" check must fire before establish_tvos_tunnel runs at all.
+        assert!(
+            msg.contains("No pairing file is cached"),
+            "expected the missing-pairing-file error, got: {msg}"
+        );
+        assert!(!msg.contains("pairing_cache_dir"));
+
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn establish_tvos_tunnel_takes_no_pin_argument() {
+        // Compile-level check that the tunnel path is verify-only and takes no PIN: a device
+        // with neither pairing_address nor reconnect_address fails on the address lookup before
+        // any I/O, which both proves the one-argument signature and keeps this test hardware-free.
+        let device = stub_device();
+        let err = device
+            .establish_tvos_tunnel(std::env::temp_dir())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no network address"));
     }
 }

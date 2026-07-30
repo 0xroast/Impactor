@@ -36,6 +36,7 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                                     pairing_address: None,
                                     reconnect_address: None,
                                     pairing_identity: None,
+                                    pairing_cache_dir: None,
                                 }));
                             }
                         }
