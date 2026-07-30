@@ -4,7 +4,10 @@ pub mod windows_dnssd;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::Path;
 use std::time::Duration;
+
+use crate::{Device, synthetic_device_id};
 
 /// Service for devices with no existing pairing, actively showing a pairing PIN on screen.
 /// This is the only service that supports first-time SRP pair-setup.
@@ -307,6 +310,105 @@ pub(crate) fn enrich_and_filter(devices: Vec<DiscoveredDevice>) -> Vec<Discovere
             d
         })
         .collect()
+}
+
+/// One physical network Apple TV's manual-pairing and reconnect advertisements, correlated by
+/// name (see `screen/tvos_pairing.rs`'s `manual_pairing_entry`/`reconnect_entry`, which this
+/// mirrors), merged into the single address and port pair `Device::new_tvos` needs.
+struct NetworkDeviceGroup {
+    name: String,
+    ip: Option<IpAddr>,
+    pairing_port: Option<u16>,
+    reconnect_port: Option<u16>,
+}
+
+/// Turns a raw scan result into the `Device` values a global device picker can list and select,
+/// one per physical Apple TV. Pure and I/O-free: callers that need a device's real UDID still
+/// have to enrich it themselves (see `Device::fetch_tvos_info`), since that requires a network
+/// round trip this function deliberately does not perform.
+///
+/// Only entries typed `AppleTV` and advertising `REMOTEPAIRING_SERVICE` or
+/// `REMOTEPAIRING_MANUAL_PAIRING_SERVICE` are considered; everything else (other device types,
+/// the legacy lockdown services, the metadata-only companion-link service) is ignored. Entries
+/// are grouped by case-insensitive name, exactly as `screen/tvos_pairing.rs` correlates them, so
+/// a device advertising both services yields one `Device` carrying both ports rather than two.
+///
+/// A group with no resolved IP address, or an empty name, is dropped rather than turned into a
+/// `Device`: an empty name would produce a `pairing_identity` of `""`, which
+/// `Device::pairing_cache_path` rejects outright, and would collide every such device onto the
+/// same synthetic id.
+pub fn group_network_devices(discovered: &[DiscoveredDevice], cache_dir: &Path) -> Vec<Device> {
+    let mut groups: HashMap<String, NetworkDeviceGroup> = HashMap::new();
+
+    for d in discovered {
+        if d.device_type != DeviceType::AppleTV {
+            continue;
+        }
+        if d.service_type != REMOTEPAIRING_SERVICE
+            && d.service_type != REMOTEPAIRING_MANUAL_PAIRING_SERVICE
+        {
+            continue;
+        }
+        if d.name.is_empty() {
+            continue;
+        }
+
+        let key = d.name.to_ascii_lowercase();
+        let entry = groups.entry(key).or_insert_with(|| NetworkDeviceGroup {
+            name: d.name.clone(),
+            ip: None,
+            pairing_port: None,
+            reconnect_port: None,
+        });
+
+        // The first entry to resolve an address for this device wins; a later entry for the
+        // same physical device never overrides it. Scan order between the manual-pairing and
+        // reconnect entries is not guaranteed stable across scans (the Windows backend walks a
+        // HashMap internally), so preferring "first seen" over "last seen" keeps the chosen
+        // address from flapping between otherwise-identical scans.
+        if entry.ip.is_none() {
+            if let Some(ip_str) = &d.ip_address {
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    entry.ip = Some(ip);
+                }
+            }
+        }
+
+        if d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE {
+            entry.pairing_port = d.port;
+        } else if d.service_type == REMOTEPAIRING_SERVICE {
+            entry.reconnect_port = d.port;
+        }
+    }
+
+    let mut devices = Vec::with_capacity(groups.len());
+    for group in groups.into_values() {
+        // No resolved address means no connection info exists for this Apple TV in this scan;
+        // it cannot be turned into a usable Device, so it is treated as absent.
+        let Some(ip) = group.ip else {
+            continue;
+        };
+
+        let pairing_identity = group.name.replace(' ', "-");
+        let id = synthetic_device_id(&pairing_identity);
+
+        let mut device = Device::new_tvos(
+            group.name,
+            pairing_identity,
+            ip,
+            group.pairing_port,
+            group.reconnect_port,
+            cache_dir.to_path_buf(),
+        );
+        // Every network device would otherwise share new_tvos()'s default device_id of 0 and
+        // collide with each other under the app's id-based device-list dedupe, leaving only one
+        // Apple TV ever listed no matter how many are actually on the network.
+        device.device_id = id;
+
+        devices.push(device);
+    }
+
+    devices
 }
 
 #[allow(async_fn_in_trait)]
@@ -807,6 +909,170 @@ mod tests {
         assert_eq!(
             result.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
             vec!["Bedroom", "Living Room", "Kitchen"]
+        );
+    }
+
+    fn network_apple_tv(name: &str, service_type: &str, port: u16, ip: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            name: name.to_string(),
+            udid: None,
+            ip_address: Some(ip.to_string()),
+            port: Some(port),
+            device_type: DeviceType::AppleTV,
+            connection_type: ConnectionType::WiFi,
+            is_paired: false,
+            product_type: Some("AppleTV14,1".to_string()),
+            os_version: None,
+            service_type: service_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn group_network_devices_only_manual_sets_pairing_port_only() {
+        let discovered = [network_apple_tv(
+            "Living Room",
+            REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+            49153,
+            "10.0.0.5",
+        )];
+
+        let devices = group_network_devices(&discovered, Path::new("/cache"));
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].pairing_address,
+            Some(("10.0.0.5".parse().unwrap(), 49153))
+        );
+        assert_eq!(devices[0].reconnect_address, None);
+    }
+
+    #[test]
+    fn group_network_devices_only_reconnect_sets_reconnect_port_only() {
+        let discovered = [network_apple_tv(
+            "Living Room",
+            REMOTEPAIRING_SERVICE,
+            49152,
+            "10.0.0.5",
+        )];
+
+        let devices = group_network_devices(&discovered, Path::new("/cache"));
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].reconnect_address,
+            Some(("10.0.0.5".parse().unwrap(), 49152))
+        );
+        assert_eq!(devices[0].pairing_address, None);
+    }
+
+    #[test]
+    fn group_network_devices_merges_both_service_types_into_one_device() {
+        let discovered = [
+            network_apple_tv(
+                "Living Room",
+                REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+                49153,
+                "10.0.0.5",
+            ),
+            network_apple_tv("living room", REMOTEPAIRING_SERVICE, 49152, "10.0.0.5"),
+        ];
+
+        let devices = group_network_devices(&discovered, Path::new("/cache"));
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].pairing_address.map(|(_, p)| p), Some(49153));
+        assert_eq!(devices[0].reconnect_address.map(|(_, p)| p), Some(49152));
+    }
+
+    #[test]
+    fn group_network_devices_excludes_non_appletv() {
+        let mut d = network_apple_tv("Some iPhone", REMOTEPAIRING_SERVICE, 1, "10.0.0.5");
+        d.device_type = DeviceType::IPhone;
+
+        let devices = group_network_devices(&[d], Path::new("/cache"));
+
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn group_network_devices_excludes_non_rppairing_service() {
+        let d = network_apple_tv("Living Room", APPLE_MOBDEV2_SERVICE, 62078, "10.0.0.5");
+
+        let devices = group_network_devices(&[d], Path::new("/cache"));
+
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn group_network_devices_keeps_two_different_apple_tvs_separate() {
+        let discovered = [
+            network_apple_tv("Living Room", REMOTEPAIRING_SERVICE, 1, "10.0.0.5"),
+            network_apple_tv("Bedroom", REMOTEPAIRING_SERVICE, 2, "10.0.0.6"),
+        ];
+
+        let devices = group_network_devices(&discovered, Path::new("/cache"));
+
+        assert_eq!(devices.len(), 2);
+        let mut names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["Bedroom", "Living Room"]);
+    }
+
+    #[test]
+    fn group_network_devices_skips_empty_name() {
+        let d = network_apple_tv("", REMOTEPAIRING_SERVICE, 1, "10.0.0.5");
+
+        let devices = group_network_devices(&[d], Path::new("/cache"));
+
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn group_network_devices_skips_unresolved_ip() {
+        let mut d = network_apple_tv("Living Room", REMOTEPAIRING_SERVICE, 1, "10.0.0.5");
+        d.ip_address = None;
+
+        let devices = group_network_devices(&[d], Path::new("/cache"));
+
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn group_network_devices_sets_synthetic_device_id_and_pairing_identity() {
+        let d = network_apple_tv("Living Room", REMOTEPAIRING_SERVICE, 1, "10.0.0.5");
+
+        let devices = group_network_devices(&[d], Path::new("/cache"));
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].pairing_identity.as_deref(), Some("Living-Room"));
+        assert_eq!(devices[0].device_id, synthetic_device_id("Living-Room"));
+        assert_ne!(devices[0].device_id, 0);
+    }
+
+    #[test]
+    fn group_network_devices_keeps_first_resolved_address_when_entries_share_a_name() {
+        let discovered = [
+            network_apple_tv(
+                "Living Room",
+                REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+                49153,
+                "10.0.0.5",
+            ),
+            network_apple_tv("Living Room", REMOTEPAIRING_SERVICE, 49152, "10.0.0.9"),
+        ];
+
+        let devices = group_network_devices(&discovered, Path::new("/cache"));
+
+        assert_eq!(devices.len(), 1);
+        // The first entry encountered (the manual-pairing one, listed first above) sets the
+        // address; the later reconnect entry for the same device does not override it.
+        assert_eq!(
+            devices[0].pairing_address.unwrap().0.to_string(),
+            "10.0.0.5"
+        );
+        assert_eq!(
+            devices[0].reconnect_address.unwrap().0.to_string(),
+            "10.0.0.5"
         );
     }
 }

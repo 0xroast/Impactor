@@ -7,6 +7,7 @@ use crate::{
     defaults::get_data_path,
     screen::{Message, general},
 };
+use plume_utils::discovery::{DeviceDiscovery, PlatformDiscovery};
 use plume_utils::{Bundle, Device, PlistInfoTrait};
 
 pub(crate) fn device_listener() -> Subscription<Message> {
@@ -67,6 +68,164 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                                 Err(_) => continue,
                             };
                             let _ = tx.unbounded_send(msg);
+                        }
+                    });
+                });
+
+                while let Some(message) = rx.next().await {
+                    let _ = output.send(message).await;
+                }
+            },
+        )
+    })
+}
+
+/// Discovers network Apple TVs over mDNS and feeds them into the same `DeviceConnected`/
+/// `DeviceDisconnected` stream USB devices arrive on, so `screen/mod.rs` can list and select
+/// them the same way. Never fabricates a UDID (`Device::new_tvos` leaves it empty; a real one is
+/// adopted only via `Device::fetch_tvos_info`/`apply_tvos_info` once a pairing file exists); the
+/// udid checks in `run_installation` and `RefreshDaemon::resign_and_reinstall` are what stop a
+/// still-unenriched network device from being registered with Apple.
+pub(crate) fn network_device_listener() -> Subscription<Message> {
+    Subscription::run(|| {
+        iced::stream::channel(
+            100,
+            |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+                use iced::futures::{SinkExt, StreamExt};
+                use std::collections::{HashMap, HashSet};
+
+                let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+
+                    rt.block_on(async move {
+                        // Addresses and udid last sent to the UI for each id, so a device can be
+                        // re-emitted (screen/mod.rs replaces its stored copy in place) when
+                        // either changes - e.g. a device first seen with only a reconnect
+                        // address later gains a pairing address once the user opens its pairing
+                        // screen, or a device adopts its real udid via enrichment below. udid is
+                        // part of this key because otherwise a device already present here would
+                        // never be re-emitted purely for having gone from an empty udid to a
+                        // real one, and the enrichment below would have no way to reach the UI.
+                        type EmittedState = (
+                            Option<(std::net::IpAddr, u16)>,
+                            Option<(std::net::IpAddr, u16)>,
+                            String,
+                        );
+
+                        // Ids currently believed present: emitted as DeviceConnected and not yet
+                        // followed by a DeviceDisconnected.
+                        let mut present_ids: HashSet<u32> = HashSet::new();
+                        let mut last_emitted: HashMap<u32, EmittedState> = HashMap::new();
+                        // Consecutive scans in a row a present id was missing from the results.
+                        // Reaching 2 is what actually emits DeviceDisconnected, so a single
+                        // missed scan (a common mDNS hiccup, e.g. a dropped companion-link
+                        // response) does not silently move the user's device selection -
+                        // screen/mod.rs falls back to devices.first() on disconnect, which the
+                        // user might not notice before installing to the wrong device.
+                        let mut miss_counts: HashMap<u32, u32> = HashMap::new();
+                        // Successfully fetched real identities, cached so a tunnel is attempted
+                        // at most once per id rather than on every 30s scan.
+                        let mut enriched: HashMap<u32, plume_utils::TvosDeviceInfo> =
+                            HashMap::new();
+
+                        loop {
+                            let scan_started = std::time::Instant::now();
+                            let scan_result = PlatformDiscovery::new()
+                                .discover(std::time::Duration::from_secs(5))
+                                .await;
+
+                            match scan_result {
+                                Ok(discovered) => {
+                                    let cache_dir = get_data_path();
+                                    let devices = plume_utils::discovery::group_network_devices(
+                                        &discovered,
+                                        &cache_dir,
+                                    );
+
+                                    let mut current_ids: HashSet<u32> = HashSet::new();
+
+                                    for mut device in devices {
+                                        let id = device.device_id;
+                                        current_ids.insert(id);
+                                        // Seen this round: any earlier miss streak is over.
+                                        miss_counts.remove(&id);
+
+                                        // A tunnel is attempted at most once per id, and only
+                                        // once a pairing file exists - a device that has never
+                                        // been paired has nothing to verify against, so a tunnel
+                                        // attempt would fail on every single scan for no benefit.
+                                        if let Some(info) = enriched.get(&id) {
+                                            device.apply_tvos_info(info);
+                                        } else if device.has_cached_pairing_file(&cache_dir) {
+                                            match device.fetch_tvos_info(cache_dir.clone()).await {
+                                                Ok(info) => {
+                                                    device.apply_tvos_info(&info);
+                                                    enriched.insert(id, info);
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "Could not fetch tvOS identity for {}: {e}",
+                                                        device.name
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        let state: EmittedState = (
+                                            device.pairing_address,
+                                            device.reconnect_address,
+                                            device.udid.clone(),
+                                        );
+                                        let changed = last_emitted.get(&id) != Some(&state);
+
+                                        if !present_ids.contains(&id) || changed {
+                                            present_ids.insert(id);
+                                            last_emitted.insert(id, state);
+                                            let _ =
+                                                tx.unbounded_send(Message::DeviceConnected(device));
+                                        }
+                                    }
+
+                                    let missing: Vec<u32> = present_ids
+                                        .iter()
+                                        .copied()
+                                        .filter(|id| !current_ids.contains(id))
+                                        .collect();
+
+                                    for id in missing {
+                                        let misses = miss_counts.entry(id).or_insert(0);
+                                        *misses += 1;
+                                        if *misses >= 2 {
+                                            let _ =
+                                                tx.unbounded_send(Message::DeviceDisconnected(id));
+                                            present_ids.remove(&id);
+                                            last_emitted.remove(&id);
+                                            miss_counts.remove(&id);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Left entirely untouched: a scan failure carries no
+                                    // information about which devices are still there, so it
+                                    // must not count as a miss for anything, let alone an
+                                    // immediate disconnect.
+                                    log::warn!("Network device scan failed: {e}");
+                                }
+                            }
+
+                            // A scan itself takes up to 5s, so sleeping a fixed 30s on top of
+                            // it would drift the real cadence to ~35s; subtracting the elapsed
+                            // scan time keeps each iteration starting roughly 30s after the
+                            // previous one started.
+                            let elapsed = scan_started.elapsed();
+                            let sleep_for =
+                                std::time::Duration::from_secs(30).saturating_sub(elapsed);
+                            tokio::time::sleep(sleep_for).await;
                         }
                     });
                 });
@@ -303,6 +462,18 @@ pub(crate) async fn run_installation(
                 return Err("GSA account is required for PEM signing".to_string());
             };
 
+            // Checked before any portal call, not just before qh_ensure_device: on a
+            // free-tier account at its certificate limit, CertificateIdentity::new_with_session
+            // below can revoke an existing certificate to make room for a new one, which
+            // invalidates apps already sideloaded on the user's other devices. That cost must
+            // not be paid for an install that is going to fail this same check a few lines
+            // later anyway.
+            if let Some(dev) = &device {
+                if dev.udid.is_empty() {
+                    return Err("Device UDID is unknown; cannot register it with Apple".to_string());
+                }
+            }
+
             send("Ensuring account is valid...".to_string(), 20);
 
             let session = DeveloperSession::new(
@@ -353,11 +524,6 @@ pub(crate) async fn run_installation(
             send("Ensuring device is registered...".to_string(), 30);
 
             if let Some(dev) = &device {
-                if dev.udid.is_empty() {
-                    return Err(
-                        "Device UDID is unknown; cannot register it with Apple".to_string()
-                    );
-                }
                 session
                     .qh_ensure_device(team_id, &dev.name, &dev.udid)
                     .await

@@ -98,6 +98,40 @@ impl TvosDeviceInfo {
     }
 }
 
+/// Stable, collision-avoiding device id for a device discovered over the network.
+///
+/// `Device::new_tvos` leaves `device_id` at 0 (the same default a real usbmuxd device would
+/// never have), and `u32::MAX` is reserved in `screen/mod.rs` as the sentinel for the "This Mac"
+/// gestalt device; a caller building a `Device` for a network Apple TV must replace `device_id`
+/// with this function's result to avoid colliding with either. FNV-1a is used rather than
+/// `std::collections::hash_map::DefaultHasher` because the latter's output is not guaranteed
+/// stable across Rust versions, and this id must stay the same across app restarts (it is how
+/// the device list dedupes and how disconnect events are matched to the device that connected).
+pub fn synthetic_device_id(pairing_identity: &str) -> u32 {
+    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in pairing_identity.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    // Setting the top bit both keeps the result out of usbmuxd's small sequential id space and
+    // guarantees it is never 0, since the FNV-1a output above is then unconditionally nonzero
+    // in its high half.
+    hash |= 0x8000_0000;
+
+    // The only value the top-bit setting above cannot rule out is u32::MAX itself, which is a
+    // reserved sentinel (see the doc comment); remapped to a different fixed value that is
+    // still nonzero and still has the top bit set.
+    if hash == u32::MAX {
+        hash = 0x8000_0000;
+    }
+
+    hash
+}
+
 impl Device {
     pub async fn new(usbmuxd_device: UsbmuxdDevice) -> Self {
         let name = Self::get_name_from_usbmuxd_device(&usbmuxd_device)
@@ -661,6 +695,18 @@ impl Device {
         Ok((adapter_handle, handshake))
     }
 
+    /// Whether a pairing file is already cached for this device under `cache_dir`. Lets a
+    /// caller decide whether attempting `fetch_tvos_info` is worthwhile before doing so: a
+    /// device that has never been paired has no pairing file to verify against, so a tunnel
+    /// attempt would only fail, and callers that poll periodically (e.g. network device
+    /// discovery) should treat that as "nothing to enrich yet" rather than a failure worth
+    /// logging on every poll.
+    pub fn has_cached_pairing_file(&self, cache_dir: &Path) -> bool {
+        self.pairing_cache_path(cache_dir)
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    }
+
     /// Read a network Apple TV's real identity (UDID, product type, OS version, etc.) over its
     /// tunnel's RSD handshake. mDNS never advertises these values, so this is the only way to
     /// learn a network device's actual UDID before registering it with Apple.
@@ -1126,6 +1172,24 @@ mod tests {
         std::env::temp_dir().join(format!("plume_test_{tag}_{}", uuid::Uuid::new_v4().simple()))
     }
 
+    #[test]
+    fn has_cached_pairing_file_reports_presence_and_absence() {
+        let cache_dir = unique_temp_dir("has_cached_pairing_file");
+        std::fs::create_dir_all(&cache_dir).expect("create scratch cache dir");
+
+        let mut device = stub_tvos_device();
+        device.pairing_identity = Some("has-cache-test".to_string());
+
+        assert!(!device.has_cached_pairing_file(&cache_dir));
+
+        let cache_path = device.pairing_cache_path(&cache_dir).unwrap();
+        std::fs::write(&cache_path, b"stub").unwrap();
+
+        assert!(device.has_cached_pairing_file(&cache_dir));
+
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
     async fn noop_callback(_progress: i32) {}
 
     #[tokio::test]
@@ -1194,6 +1258,77 @@ mod tests {
         assert!(!msg.contains("pairing_cache_dir"));
 
         std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// A large, cheap-to-generate corpus of distinct identities, so the invariants below are
+    /// checked across a broad slice of the hash's output space rather than a handful of
+    /// hand-picked strings.
+    fn generated_identities(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("dev-{i}")).collect()
+    }
+
+    #[test]
+    fn synthetic_device_id_is_deterministic() {
+        for name in generated_identities(100_000) {
+            assert_eq!(synthetic_device_id(&name), synthetic_device_id(&name));
+        }
+    }
+
+    #[test]
+    fn synthetic_device_id_never_zero_or_u32_max() {
+        for name in generated_identities(100_000) {
+            let id = synthetic_device_id(&name);
+            assert_ne!(id, 0, "input {name:?} produced 0");
+            assert_ne!(id, u32::MAX, "input {name:?} produced u32::MAX");
+        }
+
+        // Edge cases the generated sweep above does not naturally produce.
+        for input in ["", &"x".repeat(500)] {
+            let id = synthetic_device_id(input);
+            assert_ne!(id, 0, "input {input:?} produced 0");
+            assert_ne!(id, u32::MAX, "input {input:?} produced u32::MAX");
+        }
+    }
+
+    #[test]
+    fn synthetic_device_id_top_bit_always_set() {
+        let inputs = [
+            "",
+            "a",
+            "Living-Room",
+            "Bedroom",
+            "Apple-TV",
+            "Office",
+            &"z".repeat(200),
+        ];
+        for input in inputs {
+            let id = synthetic_device_id(input);
+            assert_eq!(
+                id & 0x8000_0000,
+                0x8000_0000,
+                "input {input:?} did not have the top bit set"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_device_id_distinct_for_realistic_names() {
+        let names = ["Living-Room", "Bedroom", "Apple-TV", "Office"];
+        let ids: Vec<u32> = names.iter().map(|n| synthetic_device_id(n)).collect();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(
+                    ids[i], ids[j],
+                    "{:?} and {:?} produced the same id",
+                    names[i], names[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_device_id_known_value_regression() {
+        assert_eq!(synthetic_device_id("Living-Room"), 0xe3eb1b88);
     }
 
     #[tokio::test]

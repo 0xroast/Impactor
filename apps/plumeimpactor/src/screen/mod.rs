@@ -197,7 +197,24 @@ impl Impactor {
                 Task::none()
             }
             Message::DeviceConnected(device) => {
-                if !self.devices.iter().any(|d| d.device_id == device.device_id) {
+                // A device already in the list is replaced in place rather than skipped: a
+                // network Apple TV can be re-announced with refreshed addresses (e.g. it starts
+                // advertising a pairing address once the user opens its pairing screen) or a
+                // newly-adopted udid (see subscriptions::network_device_listener), and the
+                // stored copy - including the current selection, if this is it - must pick that
+                // up instead of freezing at whatever was first seen.
+                if let Some(existing) = self
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.device_id == device.device_id)
+                {
+                    *existing = device.clone();
+
+                    if self.selected_device.as_ref().map(|d| d.device_id) == Some(device.device_id)
+                    {
+                        self.selected_device = Some(device.clone());
+                    }
+                } else {
                     self.devices.push(device.clone());
 
                     if self.selected_device.is_none() && device.device_id != u32::MAX {
@@ -205,9 +222,14 @@ impl Impactor {
                     }
                 }
 
-                if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
-                    if let Ok(mut devices) = daemon_devices.lock() {
-                        devices.insert(device.udid.clone(), device.clone());
+                // A network device's udid is empty until enrichment adopts a real one; keying
+                // the refresh-daemon map on an empty string would collide every such device
+                // onto one entry and evict the others.
+                if !device.udid.is_empty() {
+                    if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
+                        if let Ok(mut devices) = daemon_devices.lock() {
+                            devices.insert(device.udid.clone(), device.clone());
+                        }
                     }
                 }
 
@@ -803,6 +825,7 @@ impl Impactor {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let device_subscription = subscriptions::device_listener();
+        let network_device_subscription = subscriptions::network_device_listener();
 
         let tray_subscription = subscriptions::tray_subscription();
 
@@ -839,6 +862,7 @@ impl Impactor {
 
         Subscription::batch(vec![
             device_subscription,
+            network_device_subscription,
             tray_subscription,
             hover_subscription,
             progress_subscription,
