@@ -60,6 +60,31 @@ async fn live_installed_apps() {
         .await
         .expect("Lookup failed");
 
+    // Set PLUME_APP_ID to dump every key InstallationProxy reports for one app instead of the
+    // one-line-per-app summary.
+    if let Ok(target) = std::env::var("PLUME_APP_ID") {
+        match apps.get(&target) {
+            Some(plist::Value::Dictionary(d)) => {
+                println!("\n=== {target} ===");
+                let mut keys: Vec<_> = d.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    println!("  {k} = {:?}", d.get(&k).unwrap());
+                }
+            }
+            _ => {
+                println!("\n{target} is not installed (or is not a User app).");
+                println!("installed ids:");
+                let mut ids: Vec<_> = apps.keys().cloned().collect();
+                ids.sort();
+                for i in ids {
+                    println!("  {i}");
+                }
+            }
+        }
+        return;
+    }
+
     println!("\n{} user app(s) installed:", apps.len());
     let mut names: Vec<_> = apps.keys().cloned().collect();
     names.sort();
