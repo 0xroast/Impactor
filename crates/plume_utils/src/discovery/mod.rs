@@ -16,13 +16,34 @@ pub const REMOTEPAIRING_SERVICE: &str = "_remotepairing._tcp.local.";
 pub const APPLE_MOBDEV2_SERVICE: &str = "_apple-mobdev2._tcp.local.";
 /// Legacy service advertised by devices willing to accept a new lockdown pairing.
 pub const APPLE_PAIRABLE_SERVICE: &str = "_apple-pairable._tcp.local.";
+/// Advertised persistently by Macs, iPhones and Apple TVs alike, so unlike the four services
+/// above this is not a service anything here connects to. It exists only so entries built from
+/// it can supply the model of a same-host entry whose own advertisement carries none - a paired
+/// Apple TV that is not on its pairing screen advertises only `_remotepairing._tcp.local.`,
+/// whose TXT record has no model at all. See `enrich_and_filter`.
+pub const COMPANION_LINK_SERVICE: &str = "_companion-link._tcp.local.";
 
-/// The service types scanned by every discovery backend, in a fixed order.
+/// The service types scanned by every discovery backend, in a fixed order. Every entry built
+/// from one of these is returned to callers as a device in its own right.
 pub const SERVICE_TYPES: [&str; 4] = [
     APPLE_MOBDEV2_SERVICE,
     APPLE_PAIRABLE_SERVICE,
     REMOTEPAIRING_SERVICE,
     REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+];
+
+/// Service types browsed only to enrich `SERVICE_TYPES` entries that lack a model. Entries built
+/// from these are never themselves returned as devices - see `enrich_and_filter`.
+pub const METADATA_SERVICE_TYPES: [&str; 1] = [COMPANION_LINK_SERVICE];
+
+/// Every service type a discovery backend browses in one scan: the four device-producing
+/// services followed by the metadata-only companion-link service.
+pub const ALL_SCANNED_SERVICE_TYPES: [&str; 5] = [
+    APPLE_MOBDEV2_SERVICE,
+    APPLE_PAIRABLE_SERVICE,
+    REMOTEPAIRING_SERVICE,
+    REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+    COMPANION_LINK_SERVICE,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,6 +251,62 @@ pub(crate) fn build_device(
         os_version,
         service_type: service_type.to_string(),
     }
+}
+
+/// True when `service_type` is browsed only to enrich other entries and must never itself be
+/// surfaced as a device.
+pub(crate) fn is_metadata_service(service_type: &str) -> bool {
+    METADATA_SERVICE_TYPES.contains(&service_type)
+}
+
+/// Fills in missing model information on entries whose own advertisement carries none, using
+/// metadata-only advertisements from the same host, then drops those metadata entries.
+///
+/// Correlation is by lower-cased `name`: both device-producing and metadata-only entries derive
+/// `name` from the advertised host name (see `build_device`), so entries for one physical device
+/// share it regardless of which service they came from.
+pub(crate) fn enrich_and_filter(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
+    let mut metadata: HashMap<String, DiscoveredDevice> = HashMap::new();
+    for d in &devices {
+        if !is_metadata_service(&d.service_type) {
+            continue;
+        }
+        let key = d.name.to_ascii_lowercase();
+        let should_replace = match metadata.get(&key) {
+            Some(existing) => existing.device_type == DeviceType::Unknown,
+            None => true,
+        };
+        if should_replace {
+            metadata.insert(key, d.clone());
+        }
+    }
+
+    devices
+        .into_iter()
+        .filter(|d| !is_metadata_service(&d.service_type))
+        .map(|mut d| {
+            if let Some(meta) = metadata.get(&d.name.to_ascii_lowercase()) {
+                // Values are adopted only from a metadata advertisement that agrees about what
+                // the device is. Filling individual fields from one that disagrees would produce
+                // an incoherent entry, such as an Apple TV carrying an iPhone model.
+                let agrees = d.device_type == DeviceType::Unknown
+                    || meta.device_type == DeviceType::Unknown
+                    || d.device_type == meta.device_type;
+                if agrees {
+                    if d.device_type == DeviceType::Unknown {
+                        d.device_type = meta.device_type.clone();
+                    }
+                    if d.product_type.is_none() {
+                        d.product_type = meta.product_type.clone();
+                    }
+                    if d.os_version.is_none() {
+                        d.os_version = meta.os_version.clone();
+                    }
+                }
+            }
+            d
+        })
+        .collect()
 }
 
 #[allow(async_fn_in_trait)]
@@ -576,5 +653,160 @@ mod tests {
         ports.sort_unstable();
         assert_eq!(ports, vec![49152, 49153]);
         assert!(devices.values().all(|d| d.name == "Living Room"));
+    }
+
+    fn unknown_device(name: &str, service_type: &str, port: u16) -> DiscoveredDevice {
+        DiscoveredDevice {
+            name: name.to_string(),
+            udid: None,
+            ip_address: None,
+            port: Some(port),
+            device_type: DeviceType::Unknown,
+            connection_type: ConnectionType::WiFi,
+            is_paired: false,
+            product_type: None,
+            os_version: None,
+            service_type: service_type.to_string(),
+        }
+    }
+
+    fn companion_link_device(name: &str, product_type: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            name: name.to_string(),
+            udid: None,
+            ip_address: None,
+            port: Some(49155),
+            device_type: DeviceType::from_product_type(product_type),
+            connection_type: ConnectionType::WiFi,
+            is_paired: false,
+            product_type: Some(product_type.to_string()),
+            os_version: None,
+            service_type: COMPANION_LINK_SERVICE.to_string(),
+        }
+    }
+
+    #[test]
+    fn enrich_and_filter_fills_model_from_companion_link() {
+        let remotepairing = unknown_device("Living Room", REMOTEPAIRING_SERVICE, 49152);
+        let companion = companion_link_device("Living Room", "AppleTV14,1");
+
+        let result = enrich_and_filter(vec![remotepairing, companion]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].service_type, REMOTEPAIRING_SERVICE);
+        assert_eq!(result[0].port, Some(49152));
+        assert_eq!(result[0].device_type, DeviceType::AppleTV);
+        assert_eq!(result[0].product_type.as_deref(), Some("AppleTV14,1"));
+    }
+
+    #[test]
+    fn enrich_and_filter_name_correlation_is_case_insensitive() {
+        let remotepairing = unknown_device("Living Room", REMOTEPAIRING_SERVICE, 49152);
+        let companion = companion_link_device("living room", "AppleTV14,1");
+
+        let result = enrich_and_filter(vec![remotepairing, companion]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].device_type, DeviceType::AppleTV);
+        assert_eq!(result[0].product_type.as_deref(), Some("AppleTV14,1"));
+    }
+
+    #[test]
+    fn enrich_and_filter_does_not_overwrite_known_device_type() {
+        let mut manual = unknown_device(
+            "Living Room",
+            REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+            49153,
+        );
+        manual.device_type = DeviceType::AppleTV;
+        // A companion-link entry disagreeing with an already-known type must not win.
+        let mut companion = companion_link_device("Living Room", "iPhone15,2");
+        companion.device_type = DeviceType::IPhone;
+
+        let result = enrich_and_filter(vec![manual, companion]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].device_type, DeviceType::AppleTV);
+        // Nor may its other fields be filled from that disagreeing entry: an Apple TV carrying
+        // an iPhone model is worse than an Apple TV carrying no model at all.
+        assert_eq!(result[0].product_type, None);
+    }
+
+    #[test]
+    fn enrich_and_filter_prefers_a_typed_metadata_entry_regardless_of_order() {
+        // Several metadata entries can share a name; the one that actually identifies the
+        // device must win whichever order they arrive in.
+        for reversed in [false, true] {
+            let target = unknown_device("Living Room", REMOTEPAIRING_SERVICE, 49152);
+            let untyped = companion_link_device("Living Room", "");
+            let mut untyped = untyped;
+            untyped.device_type = DeviceType::Unknown;
+            untyped.product_type = None;
+            let typed = companion_link_device("Living Room", "AppleTV14,1");
+
+            let input = if reversed {
+                vec![target, typed, untyped]
+            } else {
+                vec![target, untyped, typed]
+            };
+            let result = enrich_and_filter(input);
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].device_type, DeviceType::AppleTV, "reversed={reversed}");
+            assert_eq!(
+                result[0].product_type.as_deref(),
+                Some("AppleTV14,1"),
+                "reversed={reversed}"
+            );
+        }
+    }
+
+    #[test]
+    fn enrich_and_filter_does_not_overwrite_known_product_type() {
+        let mut remotepairing = unknown_device("Living Room", REMOTEPAIRING_SERVICE, 49152);
+        remotepairing.product_type = Some("x".to_string());
+        let companion = companion_link_device("Living Room", "AppleTV14,1");
+
+        let result = enrich_and_filter(vec![remotepairing, companion]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].product_type.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn enrich_and_filter_drops_unmatched_metadata_entries() {
+        let companion = companion_link_device("Living Room", "AppleTV14,1");
+
+        let result = enrich_and_filter(vec![companion]);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn enrich_and_filter_does_not_cross_contaminate_hosts() {
+        let bedroom = unknown_device("Bedroom", REMOTEPAIRING_SERVICE, 49152);
+        let living_room_companion = companion_link_device("Living Room", "AppleTV14,1");
+
+        let result = enrich_and_filter(vec![bedroom, living_room_companion]);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "Bedroom");
+        assert_eq!(result[0].device_type, DeviceType::Unknown);
+        assert_eq!(result[0].product_type, None);
+    }
+
+    #[test]
+    fn enrich_and_filter_preserves_order_of_non_metadata_entries() {
+        let bedroom = unknown_device("Bedroom", REMOTEPAIRING_SERVICE, 1);
+        let companion = companion_link_device("Living Room", "AppleTV14,1");
+        let living_room = unknown_device("Living Room", REMOTEPAIRING_SERVICE, 2);
+        let kitchen = unknown_device("Kitchen", REMOTEPAIRING_SERVICE, 3);
+
+        let result = enrich_and_filter(vec![bedroom, companion, living_room, kitchen]);
+
+        assert_eq!(
+            result.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["Bedroom", "Living Room", "Kitchen"]
+        );
     }
 }

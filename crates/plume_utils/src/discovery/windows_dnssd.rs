@@ -13,8 +13,9 @@
 //! purely by the caller's timeout.
 
 use super::{
-    DeviceDiscovery, DiscoveredDevice, REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE,
-    SERVICE_TYPES, build_device, dedup_key, parse_instance_name,
+    ALL_SCANNED_SERVICE_TYPES, COMPANION_LINK_SERVICE, DeviceDiscovery, DiscoveredDevice,
+    REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE, build_device, dedup_key,
+    enrich_and_filter, parse_instance_name,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -77,15 +78,18 @@ fn query_name(service_type: &str) -> &str {
 }
 
 /// Resolve ordering for one service type. The RPPairing services are what this application
-/// exists to find, so they are resolved before the legacy lockdown services and are never the
-/// entries dropped when the concurrency cap truncates the candidate list.
+/// exists to find, so they are resolved first and are never the entries dropped when the
+/// concurrency cap truncates the candidate list. Companion-link is metadata that only enriches
+/// an RPPairing entry, so it ranks below RPPairing but still above the legacy lockdown services.
 fn resolve_priority(service_type: &str) -> u8 {
     if service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE
         || service_type == REMOTEPAIRING_SERVICE
     {
         0
-    } else {
+    } else if service_type == COMPANION_LINK_SERVICE {
         1
+    } else {
+        2
     }
 }
 
@@ -428,7 +432,10 @@ pub struct WindowsDnsSdDiscovery {
 impl WindowsDnsSdDiscovery {
     pub fn new() -> Self {
         Self {
-            service_types: SERVICE_TYPES.iter().map(|s| s.to_string()).collect(),
+            service_types: ALL_SCANNED_SERVICE_TYPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -500,7 +507,7 @@ fn scan(service_types: &[String], timeout: Duration) -> crate::Result<Vec<Discov
         devices.insert(dedup_key(&hostname, &instance_name, service_type), device);
     }
 
-    Ok(devices.into_values().collect())
+    Ok(enrich_and_filter(devices.into_values().collect()))
 }
 
 fn browse_stage(
@@ -894,10 +901,13 @@ mod tests {
 
     #[test]
     fn resolve_candidates_put_rppairing_services_first() {
-        let service_types: Vec<String> = SERVICE_TYPES.iter().map(|s| s.to_string()).collect();
-        // Indices follow SERVICE_TYPES: 0 mobdev2, 1 pairable, 2 remotepairing, 3 manual pairing.
+        let service_types: Vec<String> =
+            ALL_SCANNED_SERVICE_TYPES.iter().map(|s| s.to_string()).collect();
+        // Indices follow ALL_SCANNED_SERVICE_TYPES: 0 mobdev2, 1 pairable, 2 remotepairing,
+        // 3 manual pairing, 4 companion-link.
         let candidates = vec![
             (0usize, "b-mobdev2".to_string()),
+            (4usize, "e-companion".to_string()),
             (3usize, "d-manual".to_string()),
             (1usize, "a-pairable".to_string()),
             (2usize, "c-remotepairing".to_string()),
@@ -906,8 +916,8 @@ mod tests {
         let ordered = order_resolve_candidates(candidates.clone(), &service_types);
         assert_eq!(
             ordered.iter().map(|c| c.0).collect::<Vec<_>>(),
-            vec![2, 3, 0, 1],
-            "RPPairing service types must resolve before the legacy lockdown ones"
+            vec![2, 3, 4, 0, 1],
+            "RPPairing services resolve first, companion-link next, legacy lockdown services last"
         );
 
         // Ordering is a pure function of the input set, not of HashMap iteration order.
@@ -921,10 +931,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_priority_ranks_pairing_services_above_legacy() {
+    fn resolve_priority_ranks_pairing_above_companion_link_above_legacy() {
         assert_eq!(resolve_priority(REMOTEPAIRING_MANUAL_PAIRING_SERVICE), 0);
         assert_eq!(resolve_priority(REMOTEPAIRING_SERVICE), 0);
-        assert_eq!(resolve_priority(APPLE_MOBDEV2_SERVICE), 1);
+        assert_eq!(resolve_priority(COMPANION_LINK_SERVICE), 1);
+        assert_eq!(resolve_priority(APPLE_MOBDEV2_SERVICE), 2);
     }
 
     #[test]

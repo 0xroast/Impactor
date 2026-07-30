@@ -1,6 +1,6 @@
 use super::{
-    DeviceDiscovery, DiscoveredDevice, SERVICE_TYPES, build_device, parse_instance_name,
-    short_hostname,
+    ALL_SCANNED_SERVICE_TYPES, DeviceDiscovery, DiscoveredDevice, build_device, enrich_and_filter,
+    parse_instance_name, short_hostname,
 };
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
@@ -20,7 +20,10 @@ pub struct MdnsDiscovery {
 impl MdnsDiscovery {
     pub fn new() -> Self {
         Self {
-            service_types: SERVICE_TYPES.iter().map(|s| s.to_string()).collect(),
+            service_types: ALL_SCANNED_SERVICE_TYPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -130,7 +133,7 @@ impl DeviceDiscovery for MdnsDiscovery {
         .await
         .map_err(|e| crate::Error::Other(format!("mDNS scan task failed: {e}")))?;
 
-        Ok(discovered.into_values().collect())
+        Ok(enrich_and_filter(discovered.into_values().collect()))
     }
 }
 

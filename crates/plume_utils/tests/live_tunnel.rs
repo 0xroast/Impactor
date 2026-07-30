@@ -40,8 +40,9 @@ async fn live_tunnel() {
     }
 
     // A paired Apple TV that is not on its pairing screen advertises only the reconnect
-    // service, whose TXT record carries no model, so it types as Unknown. Selecting on the
-    // service type rather than the device type is what finds it in that state.
+    // service, whose own TXT record carries no model. Discovery now fills the model in from a
+    // same-host `_companion-link._tcp.local.` advertisement when the device is advertising one;
+    // the service-type fallback below still covers the case where it is not.
     let tv_name = devices
         .iter()
         .find(|d| d.device_type == DeviceType::AppleTV)
