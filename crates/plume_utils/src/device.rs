@@ -13,7 +13,7 @@ use idevice::rsd::RsdHandshake;
 use idevice::tcp::adapter::Adapter;
 use idevice::tcp::handle::AdapterHandle;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdDevice};
-use idevice::utils::installation;
+use idevice::utils::installation::{self, InstallProgress};
 use idevice::{IdeviceService, RemoteXpcClient};
 use plume_core::MobileProvision;
 
@@ -772,13 +772,13 @@ impl Device {
         progress_callback: F,
     ) -> Result<(), Error>
     where
-        F: FnMut(i32) -> Fut + Send + Clone + 'static,
+        F: FnMut(InstallProgress) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let callback = move |(progress, _): (u64, ())| {
+        let callback = move |(progress, _): (InstallProgress, ())| {
             let mut cb = progress_callback.clone();
             async move {
-                cb(progress as i32).await;
+                cb(progress).await;
             }
         };
         let state = ();
@@ -789,7 +789,7 @@ impl Device {
                 INSTALLATION_LABEL,
             );
 
-            installation::install_package_with_callback(
+            installation::install_package_with_progress(
                 &provider, app_path, None, callback, state,
             )
             .await?;
@@ -818,7 +818,7 @@ impl Device {
             let (mut adapter, mut handshake) =
                 self.establish_tvos_tunnel(cache_dir).await?;
 
-            installation::install_package_with_callback_rsd(
+            installation::install_package_with_progress_rsd(
                 &mut adapter,
                 &mut handshake,
                 app_path,
@@ -1226,7 +1226,7 @@ mod tests {
         std::fs::remove_dir_all(&cache_dir).ok();
     }
 
-    async fn noop_callback(_progress: i32) {}
+    async fn noop_callback(_progress: InstallProgress) {}
 
     #[tokio::test]
     async fn install_app_with_no_transport_names_the_missing_transport() {

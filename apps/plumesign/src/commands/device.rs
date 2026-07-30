@@ -8,7 +8,29 @@ use idevice::{
     installation_proxy::InstallationProxyClient,
     usbmuxd::{UsbmuxdAddr, UsbmuxdConnection},
 };
-use plume_utils::{Device, Package, get_device_for_id};
+use plume_utils::{Device, InstallProgress, Package, get_device_for_id};
+
+/// Logs one `Device::install_app` progress report. Shared by every plumesign install call site
+/// so they stay in step with each other and with new `InstallProgress` variants.
+///
+/// Upload reports arrive per megabyte and per file, so they log at debug to keep a normal install
+/// from burying its own output.
+pub fn log_install_progress(progress: InstallProgress) {
+    match progress {
+        InstallProgress::Uploading {
+            bytes_sent,
+            bytes_total,
+        } => log::debug!(
+            "Uploading: {} / {}",
+            plume_utils::format_bytes(bytes_sent),
+            plume_utils::format_bytes(bytes_total)
+        ),
+        InstallProgress::Installing { percent } => {
+            log::info!("Installation progress: {}%", percent)
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, Args)]
 #[command(arg_required_else_help = true)]
@@ -91,7 +113,7 @@ pub async fn execute(args: DeviceArgs) -> Result<()> {
         log::info!("Installing app at {:?} to device {}", app_path, device.name);
         device
             .install_app(&app_path, |progress| async move {
-                log::info!("{}", progress);
+                log_install_progress(progress);
             })
             .await?;
     }

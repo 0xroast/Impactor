@@ -73,3 +73,8 @@ reqwest = { version = "0.13", default-features = false, features = [
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
+
+# Local fork carrying chunk-level upload progress for AFC directory installs.
+# Delete this section once those changes land upstream and the rev above is bumped.
+[patch."https://github.com/jkcoxson/idevice"]
+idevice = { path = "../idevice/idevice" }

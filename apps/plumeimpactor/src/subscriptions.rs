@@ -8,7 +8,7 @@ use crate::{
     screen::{Message, general, progress::ProgressUpdate},
 };
 use plume_utils::discovery::{DeviceDiscovery, PlatformDiscovery};
-use plume_utils::{Bundle, Device, PlistInfoTrait};
+use plume_utils::{Bundle, Device, InstallProgress, PlistInfoTrait};
 
 pub(crate) fn device_listener() -> Subscription<Message> {
     Subscription::run(|| {
@@ -410,16 +410,12 @@ pub(crate) fn installation_progress_listener(
                         let rx_thread = rx.clone();
                         std::thread::spawn(move || {
                             loop {
-                                let message = {
-                                    if let Ok(guard) = rx_thread.lock() {
-                                        guard.try_recv().ok()
-                                    } else {
-                                        None
+                                // Drained to empty rather than one per tick: the terminal -1 and
+                                // 100 updates must not sit behind a queue of earlier ones.
+                                if let Ok(guard) = rx_thread.lock() {
+                                    while let Ok(update) = guard.try_recv() {
+                                        let _ = tx.unbounded_send(update);
                                     }
-                                };
-
-                                if let Some(update) = message {
-                                    let _ = tx.unbounded_send(update);
                                 }
 
                                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -437,20 +433,29 @@ pub(crate) fn installation_progress_listener(
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1_000;
-    const MB: u64 = 1_000 * KB;
-    const GB: u64 = 1_000 * MB;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{} B", bytes)
+/// Maps an upload byte count onto the 70..=90 band of the installation progress bar.
+///
+/// `bytes_total` is an estimate taken by a directory walk before the transfer starts, so
+/// `bytes_sent` can overshoot it; the ratio is clamped so the bar stays inside the band. A
+/// total of zero says nothing about how far the upload has got and reports the band floor
+/// rather than dividing.
+fn upload_progress_percent(bytes_sent: u64, bytes_total: u64) -> i32 {
+    if bytes_total == 0 {
+        return 70;
     }
+
+    let scaled = (u128::from(bytes_sent) * 20 / u128::from(bytes_total)).min(20) as i32;
+    70 + scaled
+}
+
+/// Maps an InstallationProxy percentage onto the 90..=99 band of the installation progress bar.
+///
+/// The ceiling of 99 is load bearing: `ProgressScreen::update` treats a progress value of 100
+/// as the install being finished and tears the progress subscription down, while the pairing
+/// record install and the refresh-store save still run after this callback.
+fn install_progress_percent(percent: u64) -> i32 {
+    let scaled = (percent.min(100) * 9 / 100) as i32;
+    90 + scaled
 }
 
 pub(crate) async fn run_installation(
@@ -618,7 +623,7 @@ pub(crate) async fn run_installation(
                     {
                         Ok(bytes) => format!(
                             "Sending to device ({}) - this can take several minutes over the network.",
-                            format_bytes(bytes)
+                            plume_utils::format_bytes(bytes)
                         ),
                         Err(_) => {
                             "Sending to device - this can take several minutes over the network."
@@ -628,17 +633,62 @@ pub(crate) async fn run_installation(
                     let _ = tx.send(ProgressUpdate::indeterminate(upload_status, 70));
 
                     let tx_clone = tx.clone();
-                    dev.install_app(&package_file.bundle_dir(), move |progress: i32| {
-                        let tx = tx_clone.clone();
-                        // Some libraries expect this future to be processed.
-                        // We ensure it sends and resolves immediately.
-                        Box::pin(async move {
-                            let _ = tx.send(ProgressUpdate::new(
-                                "Installing...".to_string(),
-                                70 + (progress / 5),
-                            ));
-                        })
-                    })
+                    // A chunk callback fires per megabyte and per file, far faster than the
+                    // progress listener drains, so only updates that change what the bar shows
+                    // are queued. The phase is part of the key because the upload band ends on
+                    // the same value the install band starts on.
+                    let last_sent: Arc<std::sync::Mutex<Option<(bool, i32)>>> =
+                        Arc::new(std::sync::Mutex::new(None));
+
+                    dev.install_app(
+                        &package_file.bundle_dir(),
+                        move |progress: InstallProgress| {
+                            let tx = tx_clone.clone();
+                            let last_sent = last_sent.clone();
+                            // Some libraries expect this future to be processed.
+                            // We ensure it sends and resolves immediately.
+                            Box::pin(async move {
+                                let update = match progress {
+                                    InstallProgress::Uploading {
+                                        bytes_sent,
+                                        bytes_total,
+                                    } => Some((
+                                        false,
+                                        upload_progress_percent(bytes_sent, bytes_total),
+                                        format!(
+                                            "Sending to device ({} / {})...",
+                                            plume_utils::format_bytes(bytes_sent),
+                                            plume_utils::format_bytes(bytes_total)
+                                        ),
+                                    )),
+                                    InstallProgress::Installing { percent } => Some((
+                                        true,
+                                        install_progress_percent(percent),
+                                        "Installing...".to_string(),
+                                    )),
+                                    _ => None,
+                                };
+
+                                let Some((installing, percent, status)) = update else {
+                                    return;
+                                };
+
+                                let changed = match last_sent.lock() {
+                                    Ok(mut last) => {
+                                        let key = (installing, percent);
+                                        let changed = *last != Some(key);
+                                        *last = Some(key);
+                                        changed
+                                    }
+                                    Err(_) => true,
+                                };
+
+                                if changed {
+                                    let _ = tx.send(ProgressUpdate::new(status, percent));
+                                }
+                            })
+                        },
+                    )
                     .await
                     .map_err(|e| format!("Install error: {}", e))?;
 
@@ -693,7 +743,7 @@ pub(crate) async fn run_installation(
     }
 
     if options.refresh && options.mode == SignerMode::Pem {
-        send("Saving for refresh...".to_string(), 75);
+        send("Saving for refresh...".to_string(), 99);
         let path = get_data_path().join("refresh_store");
         tokio::fs::create_dir_all(&path)
             .await
@@ -876,4 +926,89 @@ pub(crate) async fn fetch_teams(
             id: t.team_id,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{install_progress_percent, upload_progress_percent};
+
+    #[test]
+    fn upload_percent_with_zero_total_reports_the_band_floor() {
+        assert_eq!(upload_progress_percent(0, 0), 70);
+        assert_eq!(upload_progress_percent(999, 0), 70);
+    }
+
+    #[test]
+    fn upload_percent_spans_the_band_ends() {
+        assert_eq!(upload_progress_percent(0, 54_741_568), 70);
+        assert_eq!(upload_progress_percent(54_741_568, 54_741_568), 90);
+    }
+
+    #[test]
+    fn upload_percent_is_halfway_at_half_the_bytes() {
+        assert_eq!(upload_progress_percent(27_370_784, 54_741_568), 80);
+    }
+
+    #[test]
+    fn upload_percent_clamps_when_sent_exceeds_total() {
+        assert_eq!(upload_progress_percent(54_741_569, 54_741_568), 90);
+        assert_eq!(upload_progress_percent(u64::MAX, 1), 90);
+    }
+
+    #[test]
+    fn upload_percent_does_not_overflow_on_large_transfers() {
+        let four_gb: u64 = 4 * 1024 * 1024 * 1024;
+        assert_eq!(upload_progress_percent(four_gb, four_gb), 90);
+        assert_eq!(upload_progress_percent(four_gb / 2, four_gb), 80);
+        assert_eq!(upload_progress_percent(u64::MAX, u64::MAX), 90);
+    }
+
+    #[test]
+    fn upload_percent_stays_inside_the_band() {
+        let total: u64 = 54_741_568;
+        for step in 0..=40u64 {
+            let sent = total * step / 20;
+            let value = upload_progress_percent(sent, total);
+            assert!((70..=90).contains(&value), "sent {sent} produced {value}");
+        }
+    }
+
+    #[test]
+    fn install_percent_spans_the_band_without_reaching_one_hundred() {
+        assert_eq!(install_progress_percent(0), 90);
+        assert_eq!(install_progress_percent(50), 94);
+        assert_eq!(install_progress_percent(100), 99);
+    }
+
+    #[test]
+    fn install_percent_clamps_out_of_range_input() {
+        assert_eq!(install_progress_percent(250), 99);
+        assert_eq!(install_progress_percent(u64::MAX), 99);
+    }
+
+    #[test]
+    fn install_percent_never_reports_finished() {
+        for percent in 0..=300u64 {
+            let value = install_progress_percent(percent);
+            assert!(
+                (90..=99).contains(&value),
+                "percent {percent} produced {value}"
+            );
+        }
+    }
+
+    /// A completed upload and a starting install must meet, so the bar neither jumps nor
+    /// stalls at the handover between the two bands.
+    #[test]
+    fn the_bands_meet_at_the_upload_install_seam() {
+        assert_eq!(upload_progress_percent(54_741_568, 54_741_568), 90);
+        assert_eq!(install_progress_percent(0), 90);
+    }
+
+    /// The install band has to stop below the value that "Saving for refresh..." reports, which
+    /// runs after the install finishes.
+    #[test]
+    fn the_install_band_stays_under_the_refresh_save() {
+        assert!(install_progress_percent(100) <= 99);
+    }
 }

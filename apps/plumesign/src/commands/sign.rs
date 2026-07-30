@@ -9,7 +9,7 @@ use plume_utils::{Bundle, Package, Signer, SignerMode, SignerOptions};
 use crate::{
     commands::{
         account::{get_authenticated_account, teams},
-        device::select_device,
+        device::{log_install_progress, select_device},
     },
     get_data_path,
 };
@@ -171,7 +171,7 @@ pub async fn execute(args: SignArgs) -> Result<()> {
                 plume_utils::install_app_mac(&bundle.bundle_dir()).await?;
             } else {
                 dev.install_app(bundle.bundle_dir(), |progress| async move {
-                    log::info!("Installation progress: {}%", progress);
+                    log_install_progress(progress);
                 })
                 .await?;
             }
@@ -179,7 +179,7 @@ pub async fn execute(args: SignArgs) -> Result<()> {
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             {
                 dev.install_app(bundle.bundle_dir(), |progress| async move {
-                    log::info!("Installation progress: {}%", progress);
+                    log_install_progress(progress);
                 })
                 .await?;
             }
@@ -193,7 +193,7 @@ pub async fn execute(args: SignArgs) -> Result<()> {
         if let Some(dev) = device {
             log::info!("Installing to device: {}", dev.name);
             dev.install_app(bundle.bundle_dir(), |progress| async move {
-                log::info!("Installation progress: {}%", progress);
+                log_install_progress(progress);
             })
             .await?;
 

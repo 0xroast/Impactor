@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub use bundle::{Bundle, BundleType}; // Bundle helper
 pub use device::{Device, TvosDeviceInfo, get_device_for_id, install_app_mac, synthetic_device_id}; // Device helper
+pub use idevice::utils::installation::InstallProgress; // Progress reported by `Device::install_app`
 pub use options::{
     SignerApp, // Supported app types
     SignerAppReal,
@@ -129,6 +130,24 @@ pub async fn dir_total_bytes(dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Renders a byte count for display, in decimal units to match how Apple's own tools report
+/// file sizes. Sub-megabyte values keep whole units because a decimal place there is noise.
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000 * KB;
+    const GB: u64 = 1_000 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +206,20 @@ mod tests {
         assert_eq!(total, 60);
 
         tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[test]
+    fn format_bytes_picks_a_unit_per_magnitude() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1 KB");
+        assert_eq!(format_bytes(999_999), "999 KB");
+        assert_eq!(format_bytes(1_000_000), "1.0 MB");
+        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
+    }
+
+    #[test]
+    fn format_bytes_renders_the_test_bundle_size() {
+        assert_eq!(format_bytes(54_741_568), "54.7 MB");
     }
 }
