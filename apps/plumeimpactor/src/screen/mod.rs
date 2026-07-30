@@ -1,6 +1,6 @@
 pub(crate) mod general;
 mod package;
-mod progress;
+pub(crate) mod progress;
 pub(crate) mod settings;
 mod tvos_pairing;
 mod utilties;
@@ -835,19 +835,15 @@ impl Impactor {
             Subscription::none()
         };
 
-        let progress_subscription =
-            if let ImpactorScreen::Progress(ref progress) = self.current_screen {
-                subscriptions::installation_progress_listener(progress.progress_rx.clone()).map(
-                    |(status, progress_val)| {
-                        Message::ProgressScreen(progress::Message::InstallationProgress(
-                            status,
-                            progress_val,
-                        ))
-                    },
-                )
-            } else {
-                Subscription::none()
-            };
+        let progress_subscription = if let ImpactorScreen::Progress(ref progress) =
+            self.current_screen
+        {
+            subscriptions::installation_progress_listener(progress.progress_rx.clone()).map(
+                |update| Message::ProgressScreen(progress::Message::InstallationProgress(update)),
+            )
+        } else {
+            Subscription::none()
+        };
 
         let tray_menu_refresh_subscription = subscriptions::tray_menu_refresh_subscription();
         let certificate_reset_subscription = subscriptions::certificate_reset_subscription();
@@ -1073,14 +1069,18 @@ impl Impactor {
                     .await
                     {
                         Ok(_) => {
-                            let _ = tx.send(("Installation complete!".to_string(), 100));
+                            let _ = tx.send(progress::ProgressUpdate::new(
+                                "Installation complete!".to_string(),
+                                100,
+                            ));
 
                             if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
                                 package.remove_package_stage();
                             }
                         }
                         Err(e) => {
-                            let _ = tx_error.send((format!("Error: {}", e), -1));
+                            let _ = tx_error
+                                .send(progress::ProgressUpdate::new(format!("Error: {}", e), -1));
 
                             if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
                                 package.remove_package_stage();

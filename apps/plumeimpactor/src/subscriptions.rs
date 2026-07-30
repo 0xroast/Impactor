@@ -5,7 +5,7 @@ use tray_icon::{TrayIconEvent, menu::MenuEvent};
 
 use crate::{
     defaults::get_data_path,
-    screen::{Message, general},
+    screen::{Message, general, progress::ProgressUpdate},
 };
 use plume_utils::discovery::{DeviceDiscovery, PlatformDiscovery};
 use plume_utils::{Bundle, Device, PlistInfoTrait};
@@ -382,12 +382,12 @@ pub(crate) fn file_hover_subscription() -> Subscription<Message> {
 }
 
 pub(crate) fn installation_progress_listener(
-    progress_rx: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(String, i32)>>>>,
-) -> Subscription<(String, i32)> {
+    progress_rx: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ProgressUpdate>>>>,
+) -> Subscription<ProgressUpdate> {
     match progress_rx {
         Some(rx) => {
             struct State {
-                rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(String, i32)>>>,
+                rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ProgressUpdate>>>,
             }
 
             impl std::hash::Hash for State {
@@ -401,11 +401,11 @@ pub(crate) fn installation_progress_listener(
                 let rx = state.rx.clone();
                 iced::stream::channel(
                     100,
-                    move |mut output: iced::futures::channel::mpsc::Sender<(String, i32)>| async move {
+                    move |mut output: iced::futures::channel::mpsc::Sender<ProgressUpdate>| async move {
                         use iced::futures::{SinkExt, StreamExt};
 
                         let (tx, mut rx_stream) =
-                            iced::futures::channel::mpsc::unbounded::<(String, i32)>();
+                            iced::futures::channel::mpsc::unbounded::<ProgressUpdate>();
 
                         let rx_thread = rx.clone();
                         std::thread::spawn(move || {
@@ -418,8 +418,8 @@ pub(crate) fn installation_progress_listener(
                                     }
                                 };
 
-                                if let Some((status, progress)) = message {
-                                    let _ = tx.unbounded_send((status, progress));
+                                if let Some(update) = message {
+                                    let _ = tx.unbounded_send(update);
                                 }
 
                                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -437,13 +437,29 @@ pub(crate) fn installation_progress_listener(
     }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000 * KB;
+    const GB: u64 = 1_000 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 pub(crate) async fn run_installation(
     package: &plume_utils::Package,
     device: Option<&Device>,
     options: &plume_utils::SignerOptions,
     account: Option<&plume_store::GsaAccount>,
     mut store: Option<&mut plume_store::AccountStore>,
-    tx: &std::sync::mpsc::Sender<(String, i32)>,
+    tx: &std::sync::mpsc::Sender<ProgressUpdate>,
 ) -> Result<(), String> {
     use plume_core::{
         AnisetteConfiguration, CertificateIdentity,
@@ -454,7 +470,7 @@ pub(crate) async fn run_installation(
     let package_file: Bundle;
     let mut options = options.clone();
     let send = |msg: String, progress: i32| {
-        let _ = tx.send((msg, progress));
+        let _ = tx.send(ProgressUpdate::new(msg, progress));
     };
     let platform = match device {
         Some(dev) if dev.is_tvos() => DeveloperPlatform::TvOs,
@@ -595,7 +611,21 @@ pub(crate) async fn run_installation(
         SignerInstallMode::Install => {
             if let Some(dev) = &device {
                 if !dev.is_mac {
-                    send("Sending to device...".to_string(), 70);
+                    let upload_status = match plume_utils::dir_total_bytes(
+                        package_file.bundle_dir(),
+                    )
+                    .await
+                    {
+                        Ok(bytes) => format!(
+                            "Sending to device ({}) - this can take several minutes over the network.",
+                            format_bytes(bytes)
+                        ),
+                        Err(_) => {
+                            "Sending to device - this can take several minutes over the network."
+                                .to_string()
+                        }
+                    };
+                    let _ = tx.send(ProgressUpdate::indeterminate(upload_status, 70));
 
                     let tx_clone = tx.clone();
                     dev.install_app(&package_file.bundle_dir(), move |progress: i32| {
@@ -603,7 +633,10 @@ pub(crate) async fn run_installation(
                         // Some libraries expect this future to be processed.
                         // We ensure it sends and resolves immediately.
                         Box::pin(async move {
-                            let _ = tx.send(("Installing...".to_string(), 70 + (progress / 5)));
+                            let _ = tx.send(ProgressUpdate::new(
+                                "Installing...".to_string(),
+                                70 + (progress / 5),
+                            ));
                         })
                     })
                     .await
