@@ -1,16 +1,17 @@
-use super::{ConnectionType, DeviceDiscovery, DiscoveredDevice, DeviceType};
+use super::{
+    DeviceDiscovery, DiscoveredDevice, SERVICE_TYPES, build_device, parse_instance_name,
+    short_hostname,
+};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Service for devices with no existing pairing, actively showing a pairing PIN on screen.
-/// This is the only service that supports first-time SRP pair-setup.
-pub const REMOTEPAIRING_MANUAL_PAIRING_SERVICE: &str = "_remotepairing-manual-pairing._tcp.local.";
-/// Service for devices with an existing pairing. Reconnect (pair-verify) only - does not
-/// support first-time pairing.
-pub const REMOTEPAIRING_SERVICE: &str = "_remotepairing._tcp.local.";
-const APPLE_MOBDEV2_SERVICE: &str = "_apple-mobdev2._tcp.local.";
-const APPLE_PAIRABLE_SERVICE: &str = "_apple-pairable._tcp.local.";
+/// The service-type constants live in the parent module so every backend shares them; they are
+/// re-exported here because callers import them from this path.
+pub use super::{
+    APPLE_MOBDEV2_SERVICE, APPLE_PAIRABLE_SERVICE, REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+    REMOTEPAIRING_SERVICE,
+};
 
 pub struct MdnsDiscovery {
     service_types: Vec<String>,
@@ -19,12 +20,7 @@ pub struct MdnsDiscovery {
 impl MdnsDiscovery {
     pub fn new() -> Self {
         Self {
-            service_types: vec![
-                APPLE_MOBDEV2_SERVICE.to_string(),
-                APPLE_PAIRABLE_SERVICE.to_string(),
-                REMOTEPAIRING_SERVICE.to_string(),
-                REMOTEPAIRING_MANUAL_PAIRING_SERVICE.to_string(),
-            ],
+            service_types: SERVICE_TYPES.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -78,89 +74,38 @@ impl DeviceDiscovery for MdnsDiscovery {
                                 .map(|p| (p.key().to_string(), p.val_str().to_string()))
                                 .collect();
 
-                            let device_class = properties
-                                .get("DeviceClass")
-                                .or_else(|| properties.get("deviceClass"))
-                                .map(|s| s.as_str())
-                                .unwrap_or("");
-
-                            let device_type = if !device_class.is_empty() {
-                                DeviceType::from_device_class(device_class)
-                            } else if let Some(pt) = properties.get("ProductType") {
-                                DeviceType::from_product_type(pt)
-                            } else {
-                                DeviceType::Unknown
-                            };
-
-                            let product_type = properties
-                                .get("ProductType")
-                                .or_else(|| properties.get("model"))
-                                .cloned();
-                            let os_version = properties
-                                .get("OSVersion")
-                                .or_else(|| properties.get("osVersion"))
-                                .cloned();
-
                             let hostname = info.get_hostname();
-                            let name = {
-                                let friendly = hostname
-                                    .trim_end_matches('.')
-                                    .trim_end_matches(".local")
-                                    .replace('-', " ");
-                                if friendly.is_empty() {
-                                    properties
-                                        .get("Name")
-                                        .or_else(|| properties.get("name"))
-                                        .cloned()
-                                        .unwrap_or_else(|| info.get_fullname().to_string())
-                                } else {
-                                    friendly
-                                }
-                            };
-
-                            let udid = properties
-                                .get("UniqueDeviceID")
-                                .or_else(|| properties.get("udid"))
-                                .or_else(|| properties.get("identifier"))
-                                .cloned();
-
-                            let addresses = info.get_addresses();
-                            let ip_address =
-                                addresses.iter().next().map(|addr| addr.to_string());
+                            let instance_name =
+                                parse_instance_name(info.get_fullname(), service_type);
+                            let addresses: Vec<std::net::IpAddr> =
+                                info.get_addresses().iter().copied().collect();
                             let port = Some(info.get_port());
-                            let is_paired = service_type.contains("mobdev2");
+
+                            // Shared with the native Windows backend so both produce identical
+                            // `DiscoveredDevice` values.
+                            let device = build_device(
+                                &instance_name,
+                                hostname,
+                                service_type,
+                                port,
+                                &addresses,
+                                &properties,
+                            );
 
                             log::debug!(
                                 "mDNS resolved: hostname={} service={} ip={:?} port={:?}",
                                 hostname,
                                 service_type,
-                                ip_address,
+                                device.ip_address,
                                 port
                             );
 
                             let key = (
-                                hostname
-                                    .trim_end_matches('.')
-                                    .trim_end_matches(".local")
-                                    .to_string(),
+                                short_hostname(hostname).to_ascii_lowercase(),
                                 service_type.clone(),
                             );
 
-                            discovered_devices.insert(
-                                key,
-                                DiscoveredDevice {
-                                    name,
-                                    udid,
-                                    ip_address,
-                                    port,
-                                    device_type,
-                                    connection_type: ConnectionType::WiFi,
-                                    is_paired,
-                                    product_type,
-                                    os_version,
-                                    service_type: service_type.clone(),
-                                },
-                            );
+                            discovered_devices.insert(key, device);
                         }
                         Ok(_) => {
                             got_event = true;
@@ -192,6 +137,7 @@ impl DeviceDiscovery for MdnsDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::DeviceType;
 
     #[test]
     fn test_device_type_from_class() {

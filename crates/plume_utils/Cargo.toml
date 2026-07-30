@@ -25,3 +25,11 @@ decompress = { path = "../../3rdparty/decompress" }
 
 # mDNS discovery for Apple TV network scanning
 mdns-sd = "0.11"
+
+# Native DNS-SD via the Windows resolver (dnsapi.dll). The raw-socket mdns-sd backend does
+# not receive multicast responses on Windows; the OS resolver does.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_NetworkManagement_Dns",
+    "Win32_Foundation",
+] }

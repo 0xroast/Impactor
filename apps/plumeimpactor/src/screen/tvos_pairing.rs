@@ -2,10 +2,10 @@ use iced::widget::{
     button, column, container, pick_list, progress_bar, row, rule, scrollable, text, text_input,
 };
 use iced::{Center, Color, Element, Fill, Task};
-use plume_utils::discovery::mdns::{
-    MdnsDiscovery, REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE,
+use plume_utils::discovery::{
+    DeviceDiscovery, DeviceType, DiscoveredDevice, PlatformDiscovery,
+    REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE,
 };
-use plume_utils::discovery::{DeviceDiscovery, DeviceType, DiscoveredDevice};
 use plume_utils::Device;
 use std::time::Duration;
 
@@ -104,9 +104,13 @@ impl TvOsPairingScreen {
     /// advertising it (i.e. actively showing a pairing PIN). Required to start a new pairing.
     fn manual_pairing_entry(&self) -> Option<&DiscoveredDevice> {
         let name = self.selected_name.as_deref()?;
-        self.discovered
-            .iter()
-            .find(|d| d.name == name && d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE)
+        // Names are compared case-insensitively: they derive from the advertised host name, and
+        // DNS names are case-insensitive, so a device that varied its own capitalization between
+        // service types would otherwise fail to correlate with itself.
+        self.discovered.iter().find(|d| {
+            d.name.eq_ignore_ascii_case(name)
+                && d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE
+        })
     }
 
     /// The standard (already-paired) service entry for the selected device, if known.
@@ -114,7 +118,7 @@ impl TvOsPairingScreen {
         let name = self.selected_name.as_deref()?;
         self.discovered
             .iter()
-            .find(|d| d.name == name && d.service_type == REMOTEPAIRING_SERVICE)
+            .find(|d| d.name.eq_ignore_ascii_case(name) && d.service_type == REMOTEPAIRING_SERVICE)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -130,7 +134,7 @@ impl TvOsPairingScreen {
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let result: Result<Vec<DiscoveredDevice>, String> = rt.block_on(async {
-                        MdnsDiscovery::new()
+                        PlatformDiscovery::new()
                             .discover(Duration::from_secs(5))
                             .await
                             .map_err(|e| format!("Scan failed: {e}"))
