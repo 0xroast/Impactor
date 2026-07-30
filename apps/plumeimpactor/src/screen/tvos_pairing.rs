@@ -1,6 +1,7 @@
 use iced::widget::{
     button, column, container, pick_list, progress_bar, row, rule, scrollable, text, text_input,
 };
+use iced::futures::StreamExt;
 use iced::{Center, Color, Element, Fill, Task};
 use plume_utils::discovery::{
     DeviceDiscovery, DeviceType, DiscoveredDevice, PlatformDiscovery,
@@ -53,6 +54,10 @@ pub enum Message {
     SelectDevice(String),
     PinChanged(String),
     Pair,
+    /// The pairing session reached the point where the Apple TV displays its code. `false`
+    /// means the session ended without ever asking, so there is nothing to prompt for.
+    PinRequested(bool),
+    SubmitPin,
     PairComplete(Result<(), String>),
     SelectIpa,
     IpaSelected(Option<std::path::PathBuf>),
@@ -79,6 +84,12 @@ pub struct TvOsPairingScreen {
     pin: String,
     scanning: bool,
     pairing: bool,
+    /// True while the pairing session is held open waiting for the code the Apple TV is
+    /// currently showing. The PIN entry is visible only in this state.
+    awaiting_pin: bool,
+    /// Hands the typed code to the pairing thread's PIN provider. Present only for the
+    /// duration of a pairing attempt.
+    pin_sender: Option<std::sync::mpsc::SyncSender<String>>,
     status: Option<StatusMessage>,
     paired_device: Option<PairedDevice>,
     ipa_path: Option<std::path::PathBuf>,
@@ -93,6 +104,8 @@ impl TvOsPairingScreen {
             pin: String::new(),
             scanning: false,
             pairing: false,
+            awaiting_pin: false,
+            pin_sender: None,
             status: None,
             paired_device: None,
             ipa_path: None,
@@ -158,17 +171,29 @@ impl TvOsPairingScreen {
                 self.scanning = false;
                 match result {
                     Ok(devices) => {
+                        // A device's service-type entries do not all carry model information:
+                        // the manual-pairing advertisement identifies itself as an Apple TV,
+                        // but the established-pairing one advertises no model at all. Keeping
+                        // only entries that are themselves typed AppleTV would discard the
+                        // reconnect entry and with it the port needed to reach a paired device,
+                        // so every entry belonging to a name that identified as an Apple TV
+                        // under any service type is kept.
+                        let tv_names: std::collections::HashSet<String> = devices
+                            .iter()
+                            .filter(|d| d.device_type == DeviceType::AppleTV)
+                            .map(|d| d.name.to_ascii_lowercase())
+                            .collect();
                         self.discovered = devices
                             .into_iter()
-                            .filter(|d| d.device_type == DeviceType::AppleTV)
+                            .filter(|d| tv_names.contains(&d.name.to_ascii_lowercase()))
                             .collect();
-                        if self.discovered.is_empty() {
+                        if tv_names.is_empty() {
                             self.status =
                                 Some(StatusMessage::info("No Apple TVs found on this network."));
                         } else {
                             self.status = Some(StatusMessage::info(format!(
                                 "Found {} Apple TV(s). Select one to pair.",
-                                self.discovered.len()
+                                tv_names.len()
                             )));
                         }
                     }
@@ -200,9 +225,6 @@ impl TvOsPairingScreen {
                     ));
                     return Task::none();
                 };
-                if self.pin.len() != 6 {
-                    return Task::none();
-                }
 
                 let ip_str = match &dev.ip_address {
                     Some(s) => s.clone(),
@@ -226,15 +248,33 @@ impl TvOsPairingScreen {
                     .udid
                     .clone()
                     .unwrap_or_else(|| ip_str.replace('.', "-"));
-                let pin = self.pin.clone();
                 let cache_dir = get_data_path();
 
+                // The Apple TV shows no code until it has accepted the pair-setup request, so
+                // any digits left in the field predate this attempt and must not be reused.
+                self.pin.clear();
+                self.awaiting_pin = false;
                 self.pairing = true;
-                self.status = Some(StatusMessage::info("Pairing..."));
+                self.status = Some(StatusMessage::info("Connecting to Apple TV..."));
 
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                // pin_req carries the moment the device asks for its code from the pairing
+                // thread to the UI; pin_resp carries the typed code back the other way.
+                //
+                // Both UI-facing channels are async and must stay that way: these two tasks run
+                // in one batch, and a task that blocks its executor thread waiting for a result
+                // prevents every other task in the batch from being polled. Blocking here would
+                // leave the PIN prompt undelivered while the pairing thread waits for the code
+                // that only that prompt can produce.
+                let (pin_req_tx, mut pin_req_rx) = iced::futures::channel::mpsc::unbounded::<()>();
+                let (result_tx, mut result_rx) =
+                    iced::futures::channel::mpsc::unbounded::<Result<(), String>>();
+                let (pin_resp_tx, pin_resp_rx) = std::sync::mpsc::sync_channel::<String>(1);
+                self.pin_sender = Some(pin_resp_tx);
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
+                    // The provider is `Fn` and so cannot move the receiver out of itself; the
+                    // Arc<Mutex<..>> lets every invocation borrow the one receiver.
+                    let pin_resp_rx = std::sync::Arc::new(std::sync::Mutex::new(pin_resp_rx));
                     let result = rt.block_on(async move {
                         let ip: std::net::IpAddr = ip_str
                             .parse()
@@ -248,9 +288,24 @@ impl TvOsPairingScreen {
                         );
                         device
                             .pair_tvos(
-                                || {
-                                    let p = pin.clone();
-                                    async move { p }
+                                move || {
+                                    let pin_req_tx = pin_req_tx.clone();
+                                    let pin_resp_rx = pin_resp_rx.clone();
+                                    async move {
+                                        let _ = pin_req_tx.unbounded_send(());
+                                        // Blocking here is load-bearing and must stay: the
+                                        // Apple TV displays its code only while the pair-setup
+                                        // session is open, so the session has to be held for as
+                                        // long as the user takes to read and type it. This runs
+                                        // on this thread's own runtime with nothing else on it.
+                                        // An empty code on timeout or on a closed channel fails
+                                        // the handshake cleanly instead of waiting forever.
+                                        let Ok(rx) = pin_resp_rx.lock() else {
+                                            return String::new();
+                                        };
+                                        rx.recv_timeout(Duration::from_secs(180))
+                                            .unwrap_or_default()
+                                    }
                                 },
                                 cache_dir,
                             )
@@ -258,24 +313,56 @@ impl TvOsPairingScreen {
                             .map(|_| ())
                             .map_err(|e| format!("{e}"))
                     });
-                    let _ = tx.send(result);
+                    let _ = result_tx.unbounded_send(result);
                 });
 
-                Task::perform(
-                    async move {
-                        std::thread::spawn(move || {
-                            rx.recv()
-                                .unwrap_or_else(|_| Err("Pairing thread error".to_string()))
-                        })
-                        .join()
-                        .unwrap()
-                    },
-                    Message::PairComplete,
-                )
+                Task::batch([
+                    Task::perform(
+                        async move {
+                            result_rx
+                                .next()
+                                .await
+                                .unwrap_or_else(|| Err("Pairing thread error".to_string()))
+                        },
+                        Message::PairComplete,
+                    ),
+                    // Resolves to false when the pairing thread drops its sender without ever
+                    // asking - the attempt ended before the device got as far as showing a code.
+                    Task::perform(
+                        async move { pin_req_rx.next().await.is_some() },
+                        Message::PinRequested,
+                    ),
+                ])
+            }
+
+            Message::PinRequested(requested) => {
+                if requested {
+                    self.awaiting_pin = true;
+                    self.status = Some(StatusMessage::info(
+                        "Enter the code shown on your Apple TV",
+                    ));
+                }
+                Task::none()
+            }
+
+            Message::SubmitPin => {
+                if self.pin.len() != 6 {
+                    return Task::none();
+                }
+                if let Some(tx) = self.pin_sender.as_ref() {
+                    // try_send so a submit can never block the UI thread; the pairing thread is
+                    // already parked on this channel, so the single slot is free.
+                    let _ = tx.try_send(self.pin.clone());
+                }
+                self.awaiting_pin = false;
+                self.status = Some(StatusMessage::info("Verifying..."));
+                Task::none()
             }
 
             Message::PairComplete(result) => {
                 self.pairing = false;
+                self.awaiting_pin = false;
+                self.pin_sender = None;
                 match result {
                     Ok(_) => {
                         // Reconstruct paired device info from the discovered entries. Prefer
@@ -438,30 +525,48 @@ impl TvOsPairingScreen {
             );
         }
 
-        // PIN entry (only when a device is selected and not yet paired)
-        if self.selected_name.is_some() && self.paired_device.is_none() {
+        // Pair button (a device is selected, pairing has not succeeded yet, and the device is
+        // not currently asking for its code). No PIN is collected here: the Apple TV does not
+        // display one until the pair-setup request it has not yet received is accepted.
+        if self.selected_name.is_some() && self.paired_device.is_none() && !self.awaiting_pin {
+            content = content
+                .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
+
+            let pair_label = if self.pairing { "Pairing..." } else { "Pair" };
+            let pair_btn = button(text(pair_label).align_x(Center))
+                .on_press_maybe(if self.pairing {
+                    None
+                } else {
+                    Some(Message::Pair)
+                })
+                .style(appearance::s_button)
+                .width(Fill);
+
+            content = content.push(pair_btn);
+        }
+
+        // PIN entry (only while the device is showing its code and the session is held open)
+        if self.awaiting_pin {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
 
             content =
-                content.push(text("Enter the 6-digit PIN shown on your Apple TV:").size(13));
+                content.push(text("Enter the 6-digit code shown on your Apple TV:").size(13));
 
             let pin_input = text_input("123456", &self.pin)
                 .on_input(Message::PinChanged)
                 .width(iced::Length::Fixed(120.0));
 
-            let pair_enabled = self.pin.len() == 6 && !self.pairing;
-            let pair_label = if self.pairing { "Pairing..." } else { "Pair" };
-            let pair_btn = button(text(pair_label).align_x(Center))
-                .on_press_maybe(if pair_enabled {
-                    Some(Message::Pair)
+            let submit_btn = button(text("Submit").align_x(Center))
+                .on_press_maybe(if self.pin.len() == 6 {
+                    Some(Message::SubmitPin)
                 } else {
                     None
                 })
                 .style(appearance::s_button);
 
             content = content.push(
-                row![pin_input, pair_btn]
+                row![pin_input, submit_btn]
                     .spacing(appearance::THEME_PADDING)
                     .align_y(Center),
             );
