@@ -63,6 +63,8 @@ pub enum Message {
     IpaSelected(Option<std::path::PathBuf>),
     InstallApp,
     InstallComplete(Result<(), String>),
+    /// Discard the current pairing result and return to the scan/pair flow.
+    StartOver,
 }
 
 /// Info about a successfully paired Apple TV, retained for installation.
@@ -386,15 +388,25 @@ impl TvOsPairingScreen {
                                 }
                             }
                         }
-                        self.status = Some(StatusMessage::success(
-                            "Paired successfully! Select an IPA to install.",
-                        ));
+                        self.status = Some(StatusMessage::success("Select an IPA to install."));
                         self.pin.clear();
                     }
                     Err(e) => {
                         self.status = Some(StatusMessage::error(e));
                     }
                 }
+                Task::none()
+            }
+
+            Message::StartOver => {
+                self.paired_device = None;
+                self.ipa_path = None;
+                self.discovered.clear();
+                self.selected_name = None;
+                self.pin.clear();
+                self.awaiting_pin = false;
+                self.pin_sender = None;
+                self.status = None;
                 Task::none()
             }
 
@@ -481,146 +493,177 @@ impl TvOsPairingScreen {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let mut content = column![].spacing(appearance::THEME_PADDING);
+        // The screen is either pairing a device or installing onto one already paired. Showing
+        // both sets of controls at once leaves the scan button and device picker sitting in the
+        // middle of the install flow, where they no longer apply.
+        let content = match &self.paired_device {
+            Some(paired) => self.view_install(paired),
+            None => self.view_pairing(),
+        };
 
-        // Scan button
+        container(scrollable(content.spacing(appearance::THEME_PADDING))).into()
+    }
+
+    /// Scan, pick a device, pair, and enter the code the device shows.
+    fn view_pairing(&self) -> iced::widget::Column<'_, Message> {
+        let mut content = column![];
+
         let scan_label = if self.scanning {
             "Scanning..."
         } else {
             "Scan for Apple TVs"
         };
-        let scan_btn = button(text(scan_label).align_x(Center))
-            .on_press_maybe(if self.scanning {
-                None
-            } else {
-                Some(Message::Scan)
-            })
-            .style(appearance::s_button)
-            .width(Fill);
-        content = content.push(scan_btn);
+        content = content.push(
+            button(text(scan_label).align_x(Center))
+                .on_press_maybe(if self.scanning {
+                    None
+                } else {
+                    Some(Message::Scan)
+                })
+                .style(appearance::s_button)
+                .width(Fill),
+        );
 
-        // Status message
         if let Some(ref s) = self.status {
             content = content.push(text(&s.content).size(13).color(s.color()));
         }
 
-        // Device list (pick_list)
         if !self.discovered.is_empty() {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
 
-            // A device can appear twice (once per RPPairing service type it advertises) -
-            // dedupe by name for the picker; the specific service entries are looked up by
-            // name when needed.
+            // A device appears once per RPPairing service type it advertises, so the picker
+            // lists distinct names; the individual service entries are looked up by name.
             let mut device_names: Vec<String> =
                 self.discovered.iter().map(|d| d.name.clone()).collect();
             device_names.sort();
             device_names.dedup();
-            let selected = self.selected_name.clone();
 
             content = content.push(
-                pick_list(device_names, selected, Message::SelectDevice)
+                pick_list(device_names, self.selected_name.clone(), Message::SelectDevice)
                     .placeholder("Select an Apple TV")
                     .width(Fill),
             );
         }
 
-        // Pair button (a device is selected, pairing has not succeeded yet, and the device is
-        // not currently asking for its code). No PIN is collected here: the Apple TV does not
-        // display one until the pair-setup request it has not yet received is accepted.
-        if self.selected_name.is_some() && self.paired_device.is_none() && !self.awaiting_pin {
-            content = content
-                .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
-
+        // No code is collected before pairing starts: the Apple TV does not display one until
+        // it has accepted a pair-setup request.
+        if self.selected_name.is_some() && !self.awaiting_pin {
             let pair_label = if self.pairing { "Pairing..." } else { "Pair" };
-            let pair_btn = button(text(pair_label).align_x(Center))
-                .on_press_maybe(if self.pairing {
-                    None
-                } else {
-                    Some(Message::Pair)
-                })
-                .style(appearance::s_button)
-                .width(Fill);
-
-            content = content.push(pair_btn);
-        }
-
-        // PIN entry (only while the device is showing its code and the session is held open)
-        if self.awaiting_pin {
-            content = content
-                .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
-
-            content =
-                content.push(text("Enter the 6-digit code shown on your Apple TV:").size(13));
-
-            let pin_input = text_input("123456", &self.pin)
-                .on_input(Message::PinChanged)
-                .width(iced::Length::Fixed(120.0));
-
-            let submit_btn = button(text("Submit").align_x(Center))
-                .on_press_maybe(if self.pin.len() == 6 {
-                    Some(Message::SubmitPin)
-                } else {
-                    None
-                })
-                .style(appearance::s_button);
-
             content = content.push(
-                row![pin_input, submit_btn]
-                    .spacing(appearance::THEME_PADDING)
-                    .align_y(Center),
+                button(text(pair_label).align_x(Center))
+                    .on_press_maybe(if self.pairing {
+                        None
+                    } else {
+                        Some(Message::Pair)
+                    })
+                    .style(appearance::p_button)
+                    .width(Fill),
             );
         }
 
-        // Install section (shown after successful pairing)
-        if self.paired_device.is_some() {
+        // Shown only while the device is displaying its code and the session is held open.
+        if self.awaiting_pin {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
+            content =
+                content.push(text("Enter the 6-digit code shown on your Apple TV:").size(13));
+            content = content.push(
+                row![
+                    text_input("123456", &self.pin)
+                        .on_input(Message::PinChanged)
+                        .on_submit_maybe(if self.pin.len() == 6 {
+                            Some(Message::SubmitPin)
+                        } else {
+                            None
+                        })
+                        .width(iced::Length::Fixed(120.0)),
+                    button(text("Submit").align_x(Center))
+                        .on_press_maybe(if self.pin.len() == 6 {
+                            Some(Message::SubmitPin)
+                        } else {
+                            None
+                        })
+                        .style(appearance::p_button)
+                ]
+                .spacing(appearance::THEME_PADDING)
+                .align_y(Center),
+            );
+        }
 
-            // IPA file picker
-            let select_label = if let Some(ref path) = self.ipa_path {
-                let name = path
-                    .file_name()
+        content
+    }
+
+    /// Choose an IPA and install it onto the device that was just paired.
+    fn view_install(&self, paired: &PairedDevice) -> iced::widget::Column<'_, Message> {
+        let mut content = column![];
+
+        content = content.push(
+            text(format!("Paired with {}", paired.name)).size(appearance::THEME_FONT_SIZE + 2.0),
+        );
+
+        if let Some(ref s) = self.status {
+            content = content.push(text(&s.content).size(13).color(s.color()));
+        }
+
+        content = content
+            .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
+
+        let select_label = match &self.ipa_path {
+            Some(path) => format!(
+                "Selected: {}",
+                path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Selected".to_string());
-                format!("Selected: {name}")
-            } else {
-                "Select IPA File".to_string()
-            };
-
-            let select_btn = button(text(select_label).align_x(Center))
+                    .unwrap_or_else(|| "file".to_string())
+            ),
+            None => "Select IPA File".to_string(),
+        };
+        content = content.push(
+            button(text(select_label).align_x(Center))
                 .on_press_maybe(if self.installing {
                     None
                 } else {
                     Some(Message::SelectIpa)
                 })
                 .style(appearance::s_button)
-                .width(Fill);
-            content = content.push(select_btn);
+                .width(Fill),
+        );
 
-            // Install button
-            if self.ipa_path.is_some() {
-                let install_label = if self.installing {
-                    "Installing..."
-                } else {
-                    "Install on Apple TV"
-                };
-                let install_btn = button(text(install_label).align_x(Center))
-                    .on_press_maybe(if self.installing || self.ipa_path.is_none() {
+        if self.ipa_path.is_some() {
+            let install_label = if self.installing {
+                "Installing..."
+            } else {
+                "Install on Apple TV"
+            };
+            content = content.push(
+                button(text(install_label).align_x(Center))
+                    .on_press_maybe(if self.installing {
                         None
                     } else {
                         Some(Message::InstallApp)
                     })
                     .style(appearance::p_button)
-                    .width(Fill);
-                content = content.push(install_btn);
-            }
-
-            if self.installing {
-                content = content.push(progress_bar(0.0..=1.0, 0.5));
-            }
+                    .width(Fill),
+            );
         }
 
-        container(scrollable(content)).into()
+        if self.installing {
+            content = content.push(progress_bar(0.0..=1.0, 0.5));
+        }
+
+        content = content
+            .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
+        content = content.push(
+            button(text("Pair a Different Apple TV").align_x(Center))
+                .on_press_maybe(if self.installing {
+                    None
+                } else {
+                    Some(Message::StartOver)
+                })
+                .style(appearance::s_button)
+                .width(Fill),
+        );
+
+        content
     }
 }
