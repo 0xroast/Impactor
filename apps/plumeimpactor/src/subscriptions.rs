@@ -35,6 +35,7 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                                     is_mac: true,
                                     pairing_address: None,
                                     reconnect_address: None,
+                                    pairing_identity: None,
                                 }));
                             }
                         }
@@ -351,6 +352,11 @@ pub(crate) async fn run_installation(
             send("Ensuring device is registered...".to_string(), 30);
 
             if let Some(dev) = &device {
+                if dev.udid.is_empty() {
+                    return Err(
+                        "Device UDID is unknown; cannot register it with Apple".to_string()
+                    );
+                }
                 session
                     .qh_ensure_device(team_id, &dev.name, &dev.udid)
                     .await

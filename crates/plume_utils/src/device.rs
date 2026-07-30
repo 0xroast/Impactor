@@ -55,6 +55,44 @@ pub struct Device {
     /// Address of the `_remotepairing._tcp.local.` service, advertised whenever the Apple TV
     /// has an established pairing. Used to reconnect (pair-verify) after the initial pairing.
     pub reconnect_address: Option<(std::net::IpAddr, u16)>,
+    /// Stable key for this device's cached pairing file, for devices paired over the network.
+    /// `None` for USB devices, which are keyed by `udid`. Deliberately not the mDNS-advertised
+    /// identifier, which changes between advertisements of the same device.
+    pub pairing_identity: Option<String>,
+}
+
+/// A network Apple TV's real identity, as reported by the device itself over an RSD handshake
+/// rather than derived from mDNS advertisements.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TvosDeviceInfo {
+    pub udid: Option<String>,
+    pub product_type: Option<String>,
+    pub device_class: Option<String>,
+    pub os_version: Option<String>,
+    pub serial_number: Option<String>,
+}
+
+impl TvosDeviceInfo {
+    /// Extracts the fields the signing pipeline and device list need from an RSD handshake's
+    /// `properties` map. Pure and I/O-free: every field is read as a plist string, and a key
+    /// that is missing or holds a non-string value yields `None` rather than a stringified
+    /// fallback or a panic. `OSVersion` is preferred over `HumanReadableProductVersionString`
+    /// for `os_version`, falling back to the latter when the former is absent.
+    pub fn from_rsd_properties(props: &std::collections::HashMap<String, plist::Value>) -> Self {
+        let as_string = |key: &str| -> Option<String> {
+            props.get(key).and_then(|v| v.as_string()).map(str::to_string)
+        };
+
+        TvosDeviceInfo {
+            udid: as_string("UniqueDeviceID"),
+            product_type: as_string("ProductType"),
+            device_class: as_string("DeviceClass"),
+            os_version: as_string("OSVersion").or_else(|| {
+                as_string("HumanReadableProductVersionString")
+            }),
+            serial_number: as_string("SerialNumber"),
+        }
+    }
 }
 
 impl Device {
@@ -71,11 +109,17 @@ impl Device {
             is_mac: false,
             pairing_address: None,
             reconnect_address: None,
+            pairing_identity: None,
         }
     }
 
     /// Create a Device representing a network Apple TV (no USB connection).
-    /// `hostname` is used as the stable identifier (e.g. "Apple-TV.local").
+    /// `pairing_identity` is used as the stable key for this device's cached pairing file
+    /// (e.g. derived from its advertised name). It is not the device's real UDID: that value is
+    /// not available over mDNS at all, so `udid` is left empty here. A network device's real
+    /// UDID, once known (see `fetch_tvos_info`/`apply_tvos_info`), must never be fabricated from
+    /// mDNS data, because `udid` is what gets registered with Apple's developer portal and doing
+    /// so would consume a real device slot on a value that does not correspond to a real device.
     ///
     /// `pairing_address` should come from `_remotepairing-manual-pairing._tcp.local.` and is
     /// required for `pair_tvos()`. `reconnect_address` should come from
@@ -83,20 +127,53 @@ impl Device {
     /// is already paired; when absent, `pairing_address` is used as a fallback.
     pub fn new_tvos(
         name: String,
-        hostname: String,
+        pairing_identity: String,
         ip: std::net::IpAddr,
         pairing_port: Option<u16>,
         reconnect_port: Option<u16>,
     ) -> Self {
         Device {
             name,
-            udid: hostname,
+            udid: String::new(),
             device_id: 0,
             usbmuxd_device: None,
             is_mac: false,
             pairing_address: pairing_port.map(|port| (ip, port)),
             reconnect_address: reconnect_port.map(|port| (ip, port)),
+            pairing_identity: Some(pairing_identity),
         }
+    }
+
+    /// Path of this device's cached pairing file under `cache_dir`.
+    /// Network devices are keyed by `pairing_identity` (a stable name-derived key); USB devices,
+    /// which have no `pairing_identity`, fall back to `udid`.
+    ///
+    /// The key can originate from mDNS-advertised data on the local network, so it is validated
+    /// rather than trusted: an empty key would collapse every un-enriched network device onto
+    /// the same cache file, and a key containing a path separator or drive letter could write
+    /// outside `cache_dir` entirely. Both are rejected outright rather than sanitized, since a
+    /// rewritten key could just as easily collide two distinct devices onto one cache file.
+    pub(crate) fn pairing_cache_path(&self, cache_dir: &Path) -> Result<PathBuf, Error> {
+        let key = self.pairing_identity.as_deref().unwrap_or(&self.udid);
+
+        if key.is_empty() {
+            return Err(Error::Other(
+                "Device has neither a pairing identity nor a UDID; cannot locate its pairing \
+                 file cache"
+                    .to_string(),
+            ));
+        }
+        if key.contains('/')
+            || key.contains('\\')
+            || key.contains(':')
+            || key.chars().all(|c| c == '.')
+        {
+            return Err(Error::Other(format!(
+                "Pairing identity {key:?} is not a valid cache key"
+            )));
+        }
+
+        Ok(cache_dir.join(format!("plume_{key}.plist")))
     }
 
     async fn get_name_from_usbmuxd_device(device: &UsbmuxdDevice) -> Result<String, Error> {
@@ -390,7 +467,7 @@ impl Device {
             )
         })?;
 
-        let cache_path = cache_dir.join(format!("plume_{}.plist", self.udid));
+        let cache_path = self.pairing_cache_path(&cache_dir)?;
 
         if cache_path.exists() {
             return Ok(RpPairingFile::read_from_file(&cache_path).await?);
@@ -459,7 +536,7 @@ impl Device {
         let connect_addr = std::net::SocketAddr::new(ip, port);
 
         // Load or generate pairing file
-        let cache_path = cache_dir.join(format!("plume_{}.plist", self.udid));
+        let cache_path = self.pairing_cache_path(&cache_dir)?;
         let mut pairing_file = if cache_path.exists() {
             RpPairingFile::read_from_file(&cache_path).await?
         } else {
@@ -539,6 +616,50 @@ impl Device {
             .map_err(|e| Error::Other(format!("RSD handshake failed: {e}")))?;
 
         Ok((adapter_handle, handshake))
+    }
+
+    /// Read a network Apple TV's real identity (UDID, product type, OS version, etc.) over its
+    /// tunnel's RSD handshake. mDNS never advertises these values, so this is the only way to
+    /// learn a network device's actual UDID before registering it with Apple.
+    /// The tunnel is torn down before returning; this call exists purely to enrich a `Device`,
+    /// not to keep a connection open.
+    ///
+    /// Requires an existing cached pairing file and fails before touching the network if there
+    /// is none. Without this check, `establish_tvos_tunnel` would fall back to a full SRP
+    /// pair-setup against an unpaired device, which can put the Apple TV into "Waiting to Pair"
+    /// and show a code the caller never asked for - unacceptable for what is meant to be a
+    /// read-only identity probe.
+    pub async fn fetch_tvos_info(&self, cache_dir: PathBuf) -> Result<TvosDeviceInfo, Error> {
+        let cache_path = self.pairing_cache_path(&cache_dir)?;
+        if !cache_path.exists() {
+            return Err(Error::Other(
+                "Device has no cached pairing file; fetch_tvos_info only reads an already \
+                 paired device and will not initiate a new pairing"
+                    .to_string(),
+            ));
+        }
+
+        let (_adapter, handshake) = self.establish_tvos_tunnel(String::new(), cache_dir).await?;
+        Ok(TvosDeviceInfo::from_rsd_properties(&handshake.properties))
+    }
+
+    /// Copy the real UDID from a previously fetched `TvosDeviceInfo` into this device.
+    /// A no-op unless `self.pairing_identity` is set, i.e. unless this is a network device:
+    /// applying tvOS-sourced info to a USB device would silently overwrite its real usbmuxd
+    /// UDID with an unrelated one. Leaves `self.udid` untouched when `info.udid` is `None` or
+    /// empty, which keeps a device that has not yet been enriched (or whose RSD properties did
+    /// not carry a UDID) from ever acquiring a fabricated identity. Does not touch
+    /// `pairing_identity`, which stays keyed to the pairing file regardless of what the device
+    /// turns out to be.
+    pub fn apply_tvos_info(&mut self, info: &TvosDeviceInfo) {
+        if self.pairing_identity.is_none() {
+            return;
+        }
+        if let Some(udid) = info.udid.as_deref() {
+            if !udid.is_empty() {
+                self.udid = udid.to_string();
+            }
+        }
     }
 
     /// Install an IPA on a paired Apple TV over a TLS-PSK tunnel.
@@ -721,4 +842,230 @@ pub async fn install_app_mac(app_path: &PathBuf) -> Result<(), Error> {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub async fn install_app_mac(_app_path: &PathBuf) -> Result<(), Error> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Property map captured from a live Apple TV 4K (AppleTV14,1) RSD handshake, trimmed to
+    /// the keys `TvosDeviceInfo` reads. The handshake carries 46 keys in total; only the ones
+    /// relevant here are reproduced.
+    fn real_rsd_properties() -> HashMap<String, plist::Value> {
+        let mut props = HashMap::new();
+        props.insert(
+            "UniqueDeviceID".to_string(),
+            plist::Value::String("00008110-001E60481AD9401E".to_string()),
+        );
+        props.insert(
+            "ProductType".to_string(),
+            plist::Value::String("AppleTV14,1".to_string()),
+        );
+        props.insert(
+            "DeviceClass".to_string(),
+            plist::Value::String("AppleTV".to_string()),
+        );
+        props.insert(
+            "OSVersion".to_string(),
+            plist::Value::String("26.5".to_string()),
+        );
+        props.insert(
+            "HumanReadableProductVersionString".to_string(),
+            plist::Value::String("26.5".to_string()),
+        );
+        props.insert(
+            "SerialNumber".to_string(),
+            plist::Value::String("C6FCY44V73".to_string()),
+        );
+        props.insert(
+            "HWModel".to_string(),
+            plist::Value::String("J255AP".to_string()),
+        );
+        props.insert(
+            "ProductName".to_string(),
+            plist::Value::String("Apple TVOS".to_string()),
+        );
+        props.insert(
+            "BuildVersion".to_string(),
+            plist::Value::String("23L471".to_string()),
+        );
+        props
+    }
+
+    #[test]
+    fn from_rsd_properties_reads_real_device_fields() {
+        let info = TvosDeviceInfo::from_rsd_properties(&real_rsd_properties());
+        assert_eq!(info.udid.as_deref(), Some("00008110-001E60481AD9401E"));
+        assert_eq!(info.product_type.as_deref(), Some("AppleTV14,1"));
+        assert_eq!(info.device_class.as_deref(), Some("AppleTV"));
+        assert_eq!(info.os_version.as_deref(), Some("26.5"));
+        assert_eq!(info.serial_number.as_deref(), Some("C6FCY44V73"));
+    }
+
+    #[test]
+    fn from_rsd_properties_empty_map_yields_default() {
+        let info = TvosDeviceInfo::from_rsd_properties(&HashMap::new());
+        assert_eq!(info, TvosDeviceInfo::default());
+    }
+
+    #[test]
+    fn from_rsd_properties_non_string_value_yields_none() {
+        let mut props = HashMap::new();
+        props.insert("UniqueDeviceID".to_string(), plist::Value::Integer(12345.into()));
+
+        let info = TvosDeviceInfo::from_rsd_properties(&props);
+        assert_eq!(info.udid, None);
+    }
+
+    #[test]
+    fn from_rsd_properties_falls_back_to_human_readable_version() {
+        let mut props = HashMap::new();
+        props.insert(
+            "HumanReadableProductVersionString".to_string(),
+            plist::Value::String("17.1".to_string()),
+        );
+
+        let info = TvosDeviceInfo::from_rsd_properties(&props);
+        assert_eq!(info.os_version.as_deref(), Some("17.1"));
+    }
+
+    #[test]
+    fn from_rsd_properties_prefers_os_version_over_human_readable_when_both_present() {
+        let mut props = HashMap::new();
+        props.insert(
+            "OSVersion".to_string(),
+            plist::Value::String("26.5".to_string()),
+        );
+        props.insert(
+            "HumanReadableProductVersionString".to_string(),
+            plist::Value::String("26.5 (23L471)".to_string()),
+        );
+
+        let info = TvosDeviceInfo::from_rsd_properties(&props);
+        assert_eq!(info.os_version.as_deref(), Some("26.5"));
+    }
+
+    #[test]
+    fn new_tvos_leaves_udid_empty_and_sets_pairing_identity() {
+        let d = Device::new_tvos(
+            "Apple TV".to_string(),
+            "Apple-TV".to_string(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(1234),
+            None,
+        );
+        assert!(d.udid.is_empty());
+        assert_eq!(d.pairing_identity.as_deref(), Some("Apple-TV"));
+    }
+
+    /// Represents a USB device: keyed by `udid`, with no `pairing_identity`.
+    fn stub_device() -> Device {
+        Device {
+            name: "Test Device".to_string(),
+            udid: "EXISTING-UDID".to_string(),
+            device_id: 0,
+            usbmuxd_device: None,
+            is_mac: false,
+            pairing_address: None,
+            reconnect_address: None,
+            pairing_identity: None,
+        }
+    }
+
+    /// Represents a network (tvOS) device: keyed by `pairing_identity`, same as what
+    /// `Device::new_tvos` produces once an install has left a UDID on it via `apply_tvos_info`.
+    fn stub_tvos_device() -> Device {
+        let mut d = stub_device();
+        d.pairing_identity = Some("stable-key".to_string());
+        d
+    }
+
+    #[test]
+    fn apply_tvos_info_none_udid_leaves_existing_udid_unchanged() {
+        let mut device = stub_tvos_device();
+        let info = TvosDeviceInfo {
+            udid: None,
+            ..Default::default()
+        };
+        device.apply_tvos_info(&info);
+        assert_eq!(device.udid, "EXISTING-UDID");
+    }
+
+    #[test]
+    fn apply_tvos_info_some_udid_overwrites_existing_udid() {
+        let mut device = stub_tvos_device();
+        let info = TvosDeviceInfo {
+            udid: Some("REAL".to_string()),
+            ..Default::default()
+        };
+        device.apply_tvos_info(&info);
+        assert_eq!(device.udid, "REAL");
+    }
+
+    #[test]
+    fn apply_tvos_info_empty_udid_leaves_existing_udid_unchanged() {
+        let mut device = stub_tvos_device();
+        let info = TvosDeviceInfo {
+            udid: Some(String::new()),
+            ..Default::default()
+        };
+        device.apply_tvos_info(&info);
+        assert_eq!(device.udid, "EXISTING-UDID");
+    }
+
+    #[test]
+    fn apply_tvos_info_no_op_when_device_has_no_pairing_identity() {
+        let mut device = stub_device();
+        let info = TvosDeviceInfo {
+            udid: Some("SHOULD-NOT-APPLY".to_string()),
+            ..Default::default()
+        };
+        device.apply_tvos_info(&info);
+        assert_eq!(device.udid, "EXISTING-UDID");
+    }
+
+    #[test]
+    fn pairing_cache_path_prefers_pairing_identity_over_udid() {
+        let device = stub_tvos_device();
+        let cache_dir = Path::new("/cache");
+        assert_eq!(
+            device.pairing_cache_path(cache_dir).unwrap(),
+            cache_dir.join("plume_stable-key.plist")
+        );
+    }
+
+    #[test]
+    fn pairing_cache_path_falls_back_to_udid_when_no_pairing_identity() {
+        let device = stub_device();
+        let cache_dir = Path::new("/cache");
+        assert_eq!(
+            device.pairing_cache_path(cache_dir).unwrap(),
+            cache_dir.join("plume_EXISTING-UDID.plist")
+        );
+    }
+
+    #[test]
+    fn pairing_cache_path_rejects_empty_key() {
+        let mut device = stub_device();
+        device.udid = String::new();
+        let cache_dir = Path::new("/cache");
+        assert!(device.pairing_cache_path(cache_dir).is_err());
+    }
+
+    #[test]
+    fn pairing_cache_path_rejects_dots_only_key() {
+        let mut device = stub_device();
+        device.pairing_identity = Some("..".to_string());
+        let cache_dir = Path::new("/cache");
+        assert!(device.pairing_cache_path(cache_dir).is_err());
+    }
+
+    #[test]
+    fn pairing_cache_path_rejects_key_with_path_separator() {
+        let mut device = stub_device();
+        device.pairing_identity = Some("../evil".to_string());
+        let cache_dir = Path::new("/cache");
+        assert!(device.pairing_cache_path(cache_dir).is_err());
+    }
 }

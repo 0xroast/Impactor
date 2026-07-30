@@ -261,6 +261,10 @@ impl RefreshDaemon {
         session: &DeveloperSession,
         team_id: &str,
     ) -> Result<(), String> {
+        if device.udid.is_empty() {
+            return Err("Device UDID is unknown; cannot register it with Apple".to_string());
+        }
+
         let team_id_string = team_id.to_string();
         session
             .qh_ensure_device(&team_id_string, &device.name, &device.udid)

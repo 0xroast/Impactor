@@ -130,6 +130,9 @@ pub async fn execute(args: SignArgs) -> Result<()> {
                     device_id: 0,
                     usbmuxd_device: None,
                     is_mac: true,
+                    pairing_address: None,
+                    reconnect_address: None,
+                    pairing_identity: None,
                 })
             } else {
                 Some(select_device(args.udid).await?)

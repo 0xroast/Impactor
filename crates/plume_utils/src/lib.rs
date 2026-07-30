@@ -10,7 +10,7 @@ mod tweak;
 use std::path::Path;
 
 pub use bundle::{Bundle, BundleType}; // Bundle helper
-pub use device::{Device, get_device_for_id, install_app_mac}; // Device helper
+pub use device::{Device, TvosDeviceInfo, get_device_for_id, install_app_mac}; // Device helper
 pub use options::{
     SignerApp, // Supported app types
     SignerAppReal,

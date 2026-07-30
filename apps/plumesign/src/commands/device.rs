@@ -56,6 +56,9 @@ pub async fn execute(args: DeviceArgs) -> Result<()> {
                     device_id: 0,
                     usbmuxd_device: None,
                     is_mac: true,
+                    pairing_address: None,
+                    reconnect_address: None,
+                    pairing_identity: None,
                 }
             } else {
                 select_device(args.udid).await?
