@@ -368,7 +368,19 @@ impl Device {
     /// Apple TV is actively showing a pairing PIN (Settings > Remotes and Devices > Remote App
     /// and Devices). `pin` is the 6-digit code shown on the Apple TV screen.
     /// The resulting pairing file is cached at `cache_dir/plume_<hostname>.plist`.
-    pub async fn pair_tvos(&self, pin: String, cache_dir: PathBuf) -> Result<RpPairingFile, Error> {
+    /// `pin_provider` is invoked only once the device has accepted the pair-setup request, which
+    /// is the moment its PIN appears on screen. Taking a provider rather than a string is what
+    /// lets a caller prompt for the code at that point: the code does not exist before then, and
+    /// the device stops displaying it as soon as the session closes.
+    pub async fn pair_tvos<F, Fut>(
+        &self,
+        pin_provider: F,
+        cache_dir: PathBuf,
+    ) -> Result<RpPairingFile, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
         let (ip, port) = self.pairing_address.ok_or_else(|| {
             Error::Other(
                 "Device is not advertising the pairing service. On the Apple TV, open Settings \
@@ -385,9 +397,15 @@ impl Device {
         }
 
         let addr = std::net::SocketAddr::new(ip, port);
-        let stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .map_err(|e| Error::Other(format!("Failed to connect to Apple TV at {addr}: {e}")))?;
+        log::info!("tvOS pairing: connecting to {addr}");
+        let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
+            Error::Other(format!(
+                "Failed to connect to Apple TV at {addr}: {e}. The manual-pairing port changes \
+                 each time the Apple TV re-advertises, so a stale scan result will not connect - \
+                 scan again immediately before pairing."
+            ))
+        })?;
+        log::info!("tvOS pairing: TCP connected to {addr}, starting RPPairing handshake");
 
         let conn = RpPairingSocket::new(stream);
 
@@ -404,12 +422,14 @@ impl Device {
         pairing_client
             .connect(
                 move |_: u8| {
-                    let p = pin.clone();
-                    async move { p }
+                    log::info!("tvOS pairing: device requested the PIN");
+                    pin_provider()
                 },
                 0u8,
             )
-            .await?;
+            .await
+            .map_err(|e| Error::Other(format!("RPPairing handshake failed: {e}")))?;
+        log::info!("tvOS pairing: handshake succeeded, caching pairing file");
 
         tokio::fs::create_dir_all(&cache_dir).await?;
         pairing_file.write_to_file(&cache_path).await?;

@@ -5703,6 +5703,7 @@ name = "plume_utils"
 version = "2.6.0"
 dependencies = [
  "decompress",
+ "env_logger",
  "flate2",
  "futures",
  "goblin",

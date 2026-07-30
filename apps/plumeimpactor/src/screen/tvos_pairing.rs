@@ -247,7 +247,13 @@ impl TvOsPairingScreen {
                             reconnect_port,
                         );
                         device
-                            .pair_tvos(pin, cache_dir)
+                            .pair_tvos(
+                                || {
+                                    let p = pin.clone();
+                                    async move { p }
+                                },
+                                cache_dir,
+                            )
                             .await
                             .map(|_| ())
                             .map_err(|e| format!("{e}"))
