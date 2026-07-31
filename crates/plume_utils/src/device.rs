@@ -690,9 +690,17 @@ impl Device {
             .parse()
             .map_err(|e| Error::Other(format!("Invalid tunnel server address: {e}")))?;
         let rsd_port = tunnel.info.server_rsd_port;
+        let mtu = tunnel.info.mtu as usize;
+        let mss = mtu.saturating_sub(60);
+        log::info!("tvOS tunnel: negotiated MTU {mtu}, using MSS {mss}");
 
         let raw = tunnel.into_inner();
-        let adapter = Adapter::new(Box::new(raw), client_ip, server_ip);
+        let mut adapter = Adapter::new(Box::new(raw), client_ip, server_ip);
+        // The tunnel's own handshake settles the MTU, and the software TCP stack sends one
+        // segment per round trip, so the segment size sets the transfer rate outright. Left
+        // unset it falls back to a 1280-byte-MTU default an order of magnitude below what the
+        // tunnel carries.
+        adapter.set_mss(mss);
         let mut adapter_handle = adapter.to_async_handle();
 
         let rsd_stream = adapter_handle
