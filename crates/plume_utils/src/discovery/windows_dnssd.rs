@@ -82,8 +82,7 @@ fn query_name(service_type: &str) -> &str {
 /// concurrency cap truncates the candidate list. Companion-link is metadata that only enriches
 /// an RPPairing entry, so it ranks below RPPairing but still above the legacy lockdown services.
 fn resolve_priority(service_type: &str) -> u8 {
-    if service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE
-        || service_type == REMOTEPAIRING_SERVICE
+    if service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE || service_type == REMOTEPAIRING_SERVICE
     {
         0
     } else if service_type == COMPANION_LINK_SERVICE {
@@ -101,8 +100,12 @@ fn order_resolve_candidates(
     service_types: &[String],
 ) -> Vec<(usize, String)> {
     candidates.sort_by(|a, b| {
-        let pa = service_types.get(a.0).map_or(u8::MAX, |s| resolve_priority(s));
-        let pb = service_types.get(b.0).map_or(u8::MAX, |s| resolve_priority(s));
+        let pa = service_types
+            .get(a.0)
+            .map_or(u8::MAX, |s| resolve_priority(s));
+        let pb = service_types
+            .get(b.0)
+            .map_or(u8::MAX, |s| resolve_priority(s));
         pa.cmp(&pb).then(a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1))
     });
     candidates
@@ -150,7 +153,10 @@ unsafe fn wide_to_string(p: *const u16) -> String {
 
 enum BrowseEvent {
     /// A PTR record: the full instance name for the browsed service type.
-    Instance { service_idx: usize, full_name: String },
+    Instance {
+        service_idx: usize,
+        full_name: String,
+    },
     /// An SRV record: owner name is the full instance name.
     Srv {
         service_idx: usize,
@@ -630,7 +636,10 @@ fn apply_browse_event(
             service_idx,
             full_name,
         } => {
-            let key = (service_idx, full_name.trim_end_matches('.').to_ascii_lowercase());
+            let key = (
+                service_idx,
+                full_name.trim_end_matches('.').to_ascii_lowercase(),
+            );
             match instances.entry(key) {
                 std::collections::hash_map::Entry::Occupied(_) => false,
                 std::collections::hash_map::Entry::Vacant(slot) => {
@@ -648,7 +657,10 @@ fn apply_browse_event(
             target,
             port,
         } => {
-            let key = (service_idx, full_name.trim_end_matches('.').to_ascii_lowercase());
+            let key = (
+                service_idx,
+                full_name.trim_end_matches('.').to_ascii_lowercase(),
+            );
             let state = instances.entry(key).or_insert_with(|| InstanceState {
                 full_name,
                 ..Default::default()
@@ -665,7 +677,10 @@ fn apply_browse_event(
             full_name,
             strings,
         } => {
-            let key = (service_idx, full_name.trim_end_matches('.').to_ascii_lowercase());
+            let key = (
+                service_idx,
+                full_name.trim_end_matches('.').to_ascii_lowercase(),
+            );
             let state = instances.entry(key).or_insert_with(|| InstanceState {
                 full_name,
                 ..Default::default()
@@ -894,15 +909,20 @@ mod tests {
 
     #[test]
     fn txt_split_handles_valueless_keys() {
-        assert_eq!(split_txt("model=AppleTV14,1"), ("model".into(), "AppleTV14,1".into()));
+        assert_eq!(
+            split_txt("model=AppleTV14,1"),
+            ("model".into(), "AppleTV14,1".into())
+        );
         assert_eq!(split_txt("flag"), ("flag".into(), String::new()));
         assert_eq!(split_txt("k="), ("k".into(), String::new()));
     }
 
     #[test]
     fn resolve_candidates_put_rppairing_services_first() {
-        let service_types: Vec<String> =
-            ALL_SCANNED_SERVICE_TYPES.iter().map(|s| s.to_string()).collect();
+        let service_types: Vec<String> = ALL_SCANNED_SERVICE_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // Indices follow ALL_SCANNED_SERVICE_TYPES: 0 mobdev2, 1 pairable, 2 remotepairing,
         // 3 manual pairing, 4 companion-link.
         let candidates = vec![
@@ -993,7 +1013,10 @@ mod tests {
         let state = instances.values().next().unwrap();
         assert_eq!(state.port, Some(49152));
         assert_eq!(state.hostname.as_deref(), Some("Living-Room.local"));
-        assert_eq!(state.props.get("model").map(String::as_str), Some("AppleTV14,1"));
+        assert_eq!(
+            state.props.get("model").map(String::as_str),
+            Some("AppleTV14,1")
+        );
         assert_eq!(addrs.get("living-room.local").unwrap().len(), 1);
     }
 

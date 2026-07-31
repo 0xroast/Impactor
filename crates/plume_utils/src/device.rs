@@ -83,16 +83,18 @@ impl TvosDeviceInfo {
     /// for `os_version`, falling back to the latter when the former is absent.
     pub fn from_rsd_properties(props: &std::collections::HashMap<String, plist::Value>) -> Self {
         let as_string = |key: &str| -> Option<String> {
-            props.get(key).and_then(|v| v.as_string()).map(str::to_string)
+            props
+                .get(key)
+                .and_then(|v| v.as_string())
+                .map(str::to_string)
         };
 
         TvosDeviceInfo {
             udid: as_string("UniqueDeviceID"),
             product_type: as_string("ProductType"),
             device_class: as_string("DeviceClass"),
-            os_version: as_string("OSVersion").or_else(|| {
-                as_string("HumanReadableProductVersionString")
-            }),
+            os_version: as_string("OSVersion")
+                .or_else(|| as_string("HumanReadableProductVersionString")),
             serial_number: as_string("SerialNumber"),
         }
     }
@@ -229,6 +231,17 @@ impl Device {
     /// in this codebase, so there is no USB device to misclassify in practice.
     pub fn is_tvos(&self) -> bool {
         self.pairing_identity.is_some()
+    }
+
+    /// Whether `install_app` will reach this device over a network tunnel rather than usbmuxd.
+    ///
+    /// Mirrors the transport selection in `install_app` itself, so a caller that needs to know
+    /// which transport an install will take cannot disagree with the one it actually picks. The
+    /// distinction matters because a round trip over the tunnel costs orders of magnitude more
+    /// than one over usbmuxd.
+    pub fn is_network(&self) -> bool {
+        self.usbmuxd_device.is_none()
+            && (self.pairing_address.is_some() || self.reconnect_address.is_some())
     }
 
     async fn get_name_from_usbmuxd_device(device: &UsbmuxdDevice) -> Result<String, Error> {
@@ -631,7 +644,9 @@ impl Device {
         let stream = tokio::net::TcpStream::connect(connect_addr)
             .await
             .map_err(|e| {
-                Error::Other(format!("Could not connect to Apple TV at {connect_addr}: {e}"))
+                Error::Other(format!(
+                    "Could not connect to Apple TV at {connect_addr}: {e}"
+                ))
             })?;
         let conn = RpPairingSocket::new(stream);
 
@@ -797,10 +812,8 @@ impl Device {
                 INSTALLATION_LABEL,
             );
 
-            installation::install_package_with_progress(
-                &provider, app_path, None, callback, state,
-            )
-            .await?;
+            installation::install_package_with_progress(&provider, app_path, None, callback, state)
+                .await?;
         } else if self.pairing_address.is_some() || self.reconnect_address.is_some() {
             let cache_dir = self.pairing_cache_dir.clone().ok_or_else(|| {
                 Error::Other(
@@ -823,8 +836,7 @@ impl Device {
                 ));
             }
 
-            let (mut adapter, mut handshake) =
-                self.establish_tvos_tunnel(cache_dir).await?;
+            let (mut adapter, mut handshake) = self.establish_tvos_tunnel(cache_dir).await?;
 
             installation::install_package_with_progress_rsd(
                 &mut adapter,
@@ -837,8 +849,7 @@ impl Device {
             .await?;
         } else {
             return Err(Error::Other(
-                "Device has no USB connection and no network address; cannot install"
-                    .to_string(),
+                "Device has no USB connection and no network address; cannot install".to_string(),
             ));
         }
 
@@ -1013,7 +1024,10 @@ mod tests {
     #[test]
     fn from_rsd_properties_non_string_value_yields_none() {
         let mut props = HashMap::new();
-        props.insert("UniqueDeviceID".to_string(), plist::Value::Integer(12345.into()));
+        props.insert(
+            "UniqueDeviceID".to_string(),
+            plist::Value::Integer(12345.into()),
+        );
 
         let info = TvosDeviceInfo::from_rsd_properties(&props);
         assert_eq!(info.udid, None);
@@ -1213,7 +1227,10 @@ mod tests {
 
     /// Unique scratch directory under the system temp dir, not created on disk by this helper.
     fn unique_temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("plume_test_{tag}_{}", uuid::Uuid::new_v4().simple()))
+        std::env::temp_dir().join(format!(
+            "plume_test_{tag}_{}",
+            uuid::Uuid::new_v4().simple()
+        ))
     }
 
     #[test]
@@ -1232,6 +1249,32 @@ mod tests {
         assert!(device.has_cached_pairing_file(&cache_dir));
 
         std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// `is_network` decides whether an install pays to be archived first, so it has to agree with
+    /// the transport `install_app` actually selects rather than merely with "is this an Apple TV".
+    #[test]
+    fn is_network_follows_the_transport_install_app_picks() {
+        let mut device = stub_device();
+        assert!(
+            !device.is_network(),
+            "a device with no transport at all is not a network device"
+        );
+
+        device.reconnect_address =
+            Some((std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 49151));
+        assert!(device.is_network(), "a reconnect address makes it network");
+
+        device.reconnect_address = None;
+        device.pairing_address = Some((std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 49152));
+        assert!(device.is_network(), "a pairing address makes it network");
+
+        let mut mac = stub_device();
+        mac.is_mac = true;
+        assert!(
+            !mac.is_network(),
+            "the local Mac is not reached over a tunnel"
+        );
     }
 
     async fn noop_callback(_progress: InstallProgress) {}

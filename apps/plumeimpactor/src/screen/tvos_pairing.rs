@@ -1,13 +1,11 @@
-use iced::widget::{
-    button, column, container, pick_list, row, rule, scrollable, text, text_input,
-};
 use iced::futures::StreamExt;
+use iced::widget::{button, column, container, pick_list, row, rule, scrollable, text, text_input};
 use iced::{Center, Color, Element, Fill, Task};
+use plume_utils::Device;
 use plume_utils::discovery::{
     DeviceDiscovery, DeviceType, DiscoveredDevice, PlatformDiscovery,
     REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE,
 };
-use plume_utils::Device;
 use std::time::Duration;
 
 use crate::appearance;
@@ -267,9 +265,8 @@ impl TvOsPairingScreen {
                     // Arc<Mutex<..>> lets every invocation borrow the one receiver.
                     let pin_resp_rx = std::sync::Arc::new(std::sync::Mutex::new(pin_resp_rx));
                     let result = rt.block_on(async move {
-                        let ip: std::net::IpAddr = ip_str
-                            .parse()
-                            .map_err(|e| format!("Invalid IP: {e}"))?;
+                        let ip: std::net::IpAddr =
+                            ip_str.parse().map_err(|e| format!("Invalid IP: {e}"))?;
                         let device = Device::new_tvos(
                             name,
                             hostname,
@@ -330,9 +327,8 @@ impl TvOsPairingScreen {
             Message::PinRequested(requested) => {
                 if requested {
                     self.awaiting_pin = true;
-                    self.status = Some(StatusMessage::info(
-                        "Enter the code shown on your Apple TV",
-                    ));
+                    self.status =
+                        Some(StatusMessage::info("Enter the code shown on your Apple TV"));
                 }
                 Task::none()
             }
@@ -436,9 +432,13 @@ impl TvOsPairingScreen {
             device_names.dedup();
 
             content = content.push(
-                pick_list(device_names, self.selected_name.clone(), Message::SelectDevice)
-                    .placeholder("Select an Apple TV")
-                    .width(Fill),
+                pick_list(
+                    device_names,
+                    self.selected_name.clone(),
+                    Message::SelectDevice,
+                )
+                .placeholder("Select an Apple TV")
+                .width(Fill),
             );
         }
 
@@ -462,8 +462,7 @@ impl TvOsPairingScreen {
         if self.awaiting_pin {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
-            content =
-                content.push(text("Enter the 6-digit code shown on your Apple TV:").size(13));
+            content = content.push(text("Enter the 6-digit code shown on your Apple TV:").size(13));
             content = content.push(
                 row![
                     text_input("123456", &self.pin)
@@ -510,8 +509,8 @@ impl TvOsPairingScreen {
             content = content.push(text(&s.content).size(13).color(s.color()));
         }
 
-        content = content
-            .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
+        content =
+            content.push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
         content = content.push(
             button(text("Pair a Different Apple TV").align_x(Center))
                 .on_press(Message::StartOver)

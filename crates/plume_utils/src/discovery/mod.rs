@@ -181,7 +181,11 @@ pub(crate) fn short_hostname(hostname: &str) -> &str {
 /// ports (manual pairing versus an established pairing), so the service type is part of the key
 /// and those entries must not collapse into one. The host part is lower-cased because DNS names
 /// are case-insensitive and the same device may be advertised with differing case.
-pub(crate) fn dedup_key(hostname: &str, instance_name: &str, service_type: &str) -> (String, String) {
+pub(crate) fn dedup_key(
+    hostname: &str,
+    instance_name: &str,
+    service_type: &str,
+) -> (String, String) {
     let host = short_hostname(hostname);
     let base = if host.is_empty() { instance_name } else { host };
     (base.to_ascii_lowercase(), service_type.to_string())
@@ -535,7 +539,10 @@ mod tests {
 
     #[test]
     fn suffix_match_is_case_insensitive() {
-        assert!(ends_with_ignore_case("Living Room._TCP.LOCAL", "_tcp.local"));
+        assert!(ends_with_ignore_case(
+            "Living Room._TCP.LOCAL",
+            "_tcp.local"
+        ));
         assert!(ends_with_ignore_case("abc", "ABC"));
         assert!(!ends_with_ignore_case("abc", "abd"));
         assert!(!ends_with_ignore_case("ab", "abc"));
@@ -691,7 +698,14 @@ mod tests {
 
     #[test]
     fn mapping_marks_mobdev2_as_paired() {
-        let d = build_device("x", "", APPLE_MOBDEV2_SERVICE, Some(62078), &[], &props(&[]));
+        let d = build_device(
+            "x",
+            "",
+            APPLE_MOBDEV2_SERVICE,
+            Some(62078),
+            &[],
+            &props(&[]),
+        );
         assert!(d.is_paired);
         assert_eq!(d.device_type, DeviceType::Unknown);
         assert_eq!(d.product_type, None);
@@ -815,11 +829,7 @@ mod tests {
 
     #[test]
     fn enrich_and_filter_does_not_overwrite_known_device_type() {
-        let mut manual = unknown_device(
-            "Living Room",
-            REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
-            49153,
-        );
+        let mut manual = unknown_device("Living Room", REMOTEPAIRING_MANUAL_PAIRING_SERVICE, 49153);
         manual.device_type = DeviceType::AppleTV;
         // A companion-link entry disagreeing with an already-known type must not win.
         let mut companion = companion_link_device("Living Room", "iPhone15,2");
@@ -854,7 +864,11 @@ mod tests {
             let result = enrich_and_filter(input);
 
             assert_eq!(result.len(), 1);
-            assert_eq!(result[0].device_type, DeviceType::AppleTV, "reversed={reversed}");
+            assert_eq!(
+                result[0].device_type,
+                DeviceType::AppleTV,
+                "reversed={reversed}"
+            );
             assert_eq!(
                 result[0].product_type.as_deref(),
                 Some("AppleTV14,1"),

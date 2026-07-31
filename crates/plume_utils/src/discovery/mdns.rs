@@ -36,9 +36,8 @@ impl Default for MdnsDiscovery {
 
 impl DeviceDiscovery for MdnsDiscovery {
     async fn discover(&self, timeout: Duration) -> crate::Result<Vec<DiscoveredDevice>> {
-        let mdns = ServiceDaemon::new().map_err(|e| {
-            crate::Error::Other(format!("Failed to create mDNS daemon: {e}"))
-        })?;
+        let mdns = ServiceDaemon::new()
+            .map_err(|e| crate::Error::Other(format!("Failed to create mDNS daemon: {e}")))?;
 
         // Browse all service types simultaneously
         let mut receivers = Vec::new();
@@ -144,7 +143,10 @@ mod tests {
 
     #[test]
     fn test_device_type_from_class() {
-        assert_eq!(DeviceType::from_device_class("AppleTV"), DeviceType::AppleTV);
+        assert_eq!(
+            DeviceType::from_device_class("AppleTV"),
+            DeviceType::AppleTV
+        );
         assert_eq!(DeviceType::from_device_class("iPhone"), DeviceType::IPhone);
     }
 
