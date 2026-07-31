@@ -433,6 +433,60 @@ pub(crate) fn installation_progress_listener(
     }
 }
 
+/// Samples upload throughput so a slow transfer can be told apart from a stalling one.
+///
+/// Reports the rate since the previous sample alongside the running average: a steady figure
+/// means a systemic rate ceiling, while a figure that collapses and recovers means the transfer
+/// is stalling, which points at the transport rather than at the rate itself.
+struct UploadRate {
+    started: std::time::Instant,
+    last_at: std::time::Instant,
+    last_bytes: u64,
+}
+
+impl UploadRate {
+    /// How long to let pass between samples. Chunk callbacks arrive far too often to log each.
+    const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last_at: now,
+            last_bytes: 0,
+        }
+    }
+
+    fn sample(&mut self, bytes_sent: u64) {
+        let now = std::time::Instant::now();
+        let since_last = now.duration_since(self.last_at);
+        if since_last < Self::SAMPLE_INTERVAL {
+            return;
+        }
+
+        let mb = |bytes: u64, seconds: f64| {
+            if seconds > 0.0 {
+                bytes as f64 / seconds / 1_000_000.0
+            } else {
+                0.0
+            }
+        };
+        let current = mb(
+            bytes_sent.saturating_sub(self.last_bytes),
+            since_last.as_secs_f64(),
+        );
+        let overall = mb(bytes_sent, now.duration_since(self.started).as_secs_f64());
+
+        log::info!(
+            "upload: {} sent, {current:.2} MB/s now, {overall:.2} MB/s average",
+            plume_utils::format_bytes(bytes_sent)
+        );
+
+        self.last_at = now;
+        self.last_bytes = bytes_sent;
+    }
+}
+
 /// Maps an upload byte count onto the 70..=90 band of the installation progress bar.
 ///
 /// `bytes_total` is an estimate taken by a directory walk before the transfer starts, so
@@ -639,15 +693,23 @@ pub(crate) async fn run_installation(
                     // the same value the install band starts on.
                     let last_sent: Arc<std::sync::Mutex<Option<(bool, i32)>>> =
                         Arc::new(std::sync::Mutex::new(None));
+                    let rate = Arc::new(std::sync::Mutex::new(UploadRate::new()));
 
                     dev.install_app(
                         &package_file.bundle_dir(),
                         move |progress: InstallProgress| {
                             let tx = tx_clone.clone();
                             let last_sent = last_sent.clone();
+                            let rate = rate.clone();
                             // Some libraries expect this future to be processed.
                             // We ensure it sends and resolves immediately.
                             Box::pin(async move {
+                                if let InstallProgress::Uploading { bytes_sent, .. } = progress
+                                    && let Ok(mut rate) = rate.lock()
+                                {
+                                    rate.sample(bytes_sent);
+                                }
+
                                 let update = match progress {
                                     InstallProgress::Uploading {
                                         bytes_sent,

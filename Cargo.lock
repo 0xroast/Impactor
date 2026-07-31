@@ -5750,6 +5750,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiny-skia",
  "tokio",
+ "tracing",
  "tray-icon",
  "uuid",
  "wgpu",

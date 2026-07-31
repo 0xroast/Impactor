@@ -44,6 +44,9 @@ goblin = "0.9"
 # Errors
 env_logger = "0.11"
 log = "0.4"
+# idevice and its TCP stack emit through tracing; the "log" feature forwards those events to the
+# log facade env_logger renders, so RUST_LOG reaches them.
+tracing = { version = "0.1", features = ["log"] }
 thiserror = "2.0"
 # Utils
 futures = { version = "0.3", default-features = false, features = ["std"] }
