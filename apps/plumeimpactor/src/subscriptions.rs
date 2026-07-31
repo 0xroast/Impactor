@@ -670,19 +670,31 @@ pub(crate) async fn run_installation(
         SignerInstallMode::Install => {
             if let Some(dev) = &device {
                 if !dev.is_mac {
-                    let upload_status = match plume_utils::dir_total_bytes(
-                        package_file.bundle_dir(),
-                    )
+                    // Send one archive rather than mirroring the bundle directory. AFC costs a
+                    // round trip per file open, write and close, and the software TCP stack
+                    // behind the tunnel has one segment in flight at a time, so hundreds of
+                    // small files cost far more than the bytes in them. Compressing also cuts
+                    // what goes over the wire to roughly a third.
+                    let _ = tx.send(ProgressUpdate::indeterminate(
+                        "Packaging for transfer...".to_string(),
+                        70,
+                    ));
+
+                    let archive_package = package.clone();
+                    let bundle_dir = package_file.bundle_dir().clone();
+                    let upload_path = tokio::task::spawn_blocking(move || {
+                        archive_package.get_archive_based_on_path(&bundle_dir)
+                    })
                     .await
-                    {
-                        Ok(bytes) => format!(
-                            "Sending to device ({}) - this can take several minutes over the network.",
-                            plume_utils::format_bytes(bytes)
+                    .map_err(|e| format!("Packaging task failed: {e}"))?
+                    .map_err(|e| format!("Failed to package for transfer: {e}"))?;
+
+                    let upload_status = match tokio::fs::metadata(&upload_path).await {
+                        Ok(meta) => format!(
+                            "Sending to device ({})...",
+                            plume_utils::format_bytes(meta.len())
                         ),
-                        Err(_) => {
-                            "Sending to device - this can take several minutes over the network."
-                                .to_string()
-                        }
+                        Err(_) => "Sending to device...".to_string(),
                     };
                     let _ = tx.send(ProgressUpdate::indeterminate(upload_status, 70));
 
@@ -695,62 +707,59 @@ pub(crate) async fn run_installation(
                         Arc::new(std::sync::Mutex::new(None));
                     let rate = Arc::new(std::sync::Mutex::new(UploadRate::new()));
 
-                    dev.install_app(
-                        &package_file.bundle_dir(),
-                        move |progress: InstallProgress| {
-                            let tx = tx_clone.clone();
-                            let last_sent = last_sent.clone();
-                            let rate = rate.clone();
-                            // Some libraries expect this future to be processed.
-                            // We ensure it sends and resolves immediately.
-                            Box::pin(async move {
-                                if let InstallProgress::Uploading { bytes_sent, .. } = progress
-                                    && let Ok(mut rate) = rate.lock()
-                                {
-                                    rate.sample(bytes_sent);
+                    dev.install_app(&upload_path, move |progress: InstallProgress| {
+                        let tx = tx_clone.clone();
+                        let last_sent = last_sent.clone();
+                        let rate = rate.clone();
+                        // Some libraries expect this future to be processed.
+                        // We ensure it sends and resolves immediately.
+                        Box::pin(async move {
+                            if let InstallProgress::Uploading { bytes_sent, .. } = progress
+                                && let Ok(mut rate) = rate.lock()
+                            {
+                                rate.sample(bytes_sent);
+                            }
+
+                            let update = match progress {
+                                InstallProgress::Uploading {
+                                    bytes_sent,
+                                    bytes_total,
+                                } => Some((
+                                    false,
+                                    upload_progress_percent(bytes_sent, bytes_total),
+                                    format!(
+                                        "Sending to device ({} / {})...",
+                                        plume_utils::format_bytes(bytes_sent),
+                                        plume_utils::format_bytes(bytes_total)
+                                    ),
+                                )),
+                                InstallProgress::Installing { percent } => Some((
+                                    true,
+                                    install_progress_percent(percent),
+                                    "Installing...".to_string(),
+                                )),
+                                _ => None,
+                            };
+
+                            let Some((installing, percent, status)) = update else {
+                                return;
+                            };
+
+                            let changed = match last_sent.lock() {
+                                Ok(mut last) => {
+                                    let key = (installing, percent);
+                                    let changed = *last != Some(key);
+                                    *last = Some(key);
+                                    changed
                                 }
+                                Err(_) => true,
+                            };
 
-                                let update = match progress {
-                                    InstallProgress::Uploading {
-                                        bytes_sent,
-                                        bytes_total,
-                                    } => Some((
-                                        false,
-                                        upload_progress_percent(bytes_sent, bytes_total),
-                                        format!(
-                                            "Sending to device ({} / {})...",
-                                            plume_utils::format_bytes(bytes_sent),
-                                            plume_utils::format_bytes(bytes_total)
-                                        ),
-                                    )),
-                                    InstallProgress::Installing { percent } => Some((
-                                        true,
-                                        install_progress_percent(percent),
-                                        "Installing...".to_string(),
-                                    )),
-                                    _ => None,
-                                };
-
-                                let Some((installing, percent, status)) = update else {
-                                    return;
-                                };
-
-                                let changed = match last_sent.lock() {
-                                    Ok(mut last) => {
-                                        let key = (installing, percent);
-                                        let changed = *last != Some(key);
-                                        *last = Some(key);
-                                        changed
-                                    }
-                                    Err(_) => true,
-                                };
-
-                                if changed {
-                                    let _ = tx.send(ProgressUpdate::new(status, percent));
-                                }
-                            })
-                        },
-                    )
+                            if changed {
+                                let _ = tx.send(ProgressUpdate::new(status, percent));
+                            }
+                        })
+                    })
                     .await
                     .map_err(|e| format!("Install error: {}", e))?;
 

@@ -100,36 +100,6 @@ pub async fn copy_dir_recursively(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sums the byte length of every regular file under `dir`, recursing into subdirectories.
-/// Symlinks are skipped rather than followed, so a symlink to a directory cannot lead the
-/// walk outside `dir` and a symlink to a file is not double-counted through its target.
-pub async fn dir_total_bytes(dir: &Path) -> Result<u64> {
-    use std::collections::VecDeque;
-    use tokio::fs;
-
-    let mut total: u64 = 0;
-    let mut queue = VecDeque::new();
-    queue.push_back(dir.to_path_buf());
-
-    while let Some(current) = queue.pop_front() {
-        let mut entries = fs::read_dir(&current).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let file_type = entry.file_type().await?;
-
-            if file_type.is_symlink() {
-                continue;
-            } else if file_type.is_dir() {
-                queue.push_back(entry.path());
-            } else if file_type.is_file() {
-                total += entry.metadata().await?.len();
-            }
-        }
-    }
-
-    Ok(total)
-}
-
 /// Renders a byte count for display, in decimal units to match how Apple's own tools report
 /// file sizes. Sub-megabyte values keep whole units because a decimal place there is noise.
 pub fn format_bytes(bytes: u64) -> String {
@@ -152,62 +122,6 @@ pub fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "plume_utils_test_{tag}_{}",
-            uuid::Uuid::new_v4().simple()
-        ))
-    }
-
-    #[tokio::test]
-    async fn dir_total_bytes_empty_dir_is_zero() {
-        let dir = unique_temp_dir("dir_total_bytes_empty");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let total = dir_total_bytes(&dir).await.unwrap();
-        assert_eq!(total, 0);
-
-        tokio::fs::remove_dir_all(&dir).await.ok();
-    }
-
-    #[tokio::test]
-    async fn dir_total_bytes_sums_files_in_dir() {
-        let dir = unique_temp_dir("dir_total_bytes_sums");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("a.bin"), vec![0u8; 100])
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("b.bin"), vec![0u8; 250])
-            .await
-            .unwrap();
-
-        let total = dir_total_bytes(&dir).await.unwrap();
-        assert_eq!(total, 350);
-
-        tokio::fs::remove_dir_all(&dir).await.ok();
-    }
-
-    #[tokio::test]
-    async fn dir_total_bytes_includes_nested_subdirectories() {
-        let dir = unique_temp_dir("dir_total_bytes_nested");
-        let nested = dir.join("nested").join("deeper");
-        tokio::fs::create_dir_all(&nested).await.unwrap();
-        tokio::fs::write(dir.join("top.bin"), vec![0u8; 10])
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("nested").join("mid.bin"), vec![0u8; 20])
-            .await
-            .unwrap();
-        tokio::fs::write(nested.join("deep.bin"), vec![0u8; 30])
-            .await
-            .unwrap();
-
-        let total = dir_total_bytes(&dir).await.unwrap();
-        assert_eq!(total, 60);
-
-        tokio::fs::remove_dir_all(&dir).await.ok();
-    }
-
     #[test]
     fn format_bytes_picks_a_unit_per_magnitude() {
         assert_eq!(format_bytes(0), "0 B");
@@ -219,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn format_bytes_renders_the_test_bundle_size() {
+    fn format_bytes_rounds_to_one_decimal_at_megabytes() {
         assert_eq!(format_bytes(54_741_568), "54.7 MB");
     }
 }
