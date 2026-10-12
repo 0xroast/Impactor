@@ -22,27 +22,20 @@ jobs:
           - os: ubuntu-24.04-arm
             arch: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - name: Use Wild linker
-        uses: davidlattimore/wild-action@latest
-      - uses: snok/install-poetry@v1
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
 
-      - name: Install and cache apt pkgs
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: flatpak flatpak-builder libglib2.0-dev libsecret-1-dev libgtk-3-dev libpng-dev libjpeg-dev libgl1-mesa-dev libglu1-mesa-dev libxkbcommon-dev libexpat1-dev libtiff-dev libxdo-dev libappindicator3-dev
-          version: 1.0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder libglib2.0-dev libsecret-1-dev libgtk-3-dev libpng-dev libjpeg-dev libgl1-mesa-dev libglu1-mesa-dev libxkbcommon-dev libexpat1-dev libtiff-dev libxdo-dev libappindicator3-dev
 
       - name: Build binaries
         run: |
           make linux PROFILE=release APPIMAGE=1
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.BINARY_NAME }}-linux-${{ matrix.arch }}
           path: dist/*
@@ -62,7 +55,7 @@ jobs:
             arch: arm64
             runner: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -91,7 +84,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/plumesign.exe" "dist/plumesign-windows-${{ matrix.arch }}.exe"
 
       - name: Upload Bundles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ matrix.arch }}
           path: dist/*.exe
@@ -103,10 +96,10 @@ jobs:
       matrix:
         arch: [x86_64, x86, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download Windows Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ matrix.arch }}
           path: dist
@@ -124,74 +117,40 @@ jobs:
           move dist\nsis\installer.exe dist\Impactor-windows-${{ matrix.arch }}-setup.exe
 
       - name: Upload Installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-installer-${{ matrix.arch }}
           path: dist/Impactor-windows-${{ matrix.arch }}-setup.exe
 
   build-macos-slices:
-    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
           - target: aarch64-apple-darwin
             arch: arm
             suffix: arm64
-            osxcross_prefix: arm64-apple-darwin21.4
+            runner: macos-latest
           - target: x86_64-apple-darwin
             arch: intel
             suffix: x86_64
-            osxcross_prefix: x86_64-apple-darwin21.4
+            runner: macos-latest
+
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Setup osxcross
-        uses: Timmmm/setup-osxcross@v3
-        with:
-          osx-version: "12.3"
 
       - name: Build binaries (${{ matrix.arch }})
         run: |
-          target_env=$(echo "${{ matrix.target }}" | tr '-' '_')
-          target_env_upper=$(echo "${target_env}" | tr '[:lower:]' '[:upper:]')
-          prefix="${{ matrix.osxcross_prefix }}"
-          osxcross_bin="$(dirname "$(command -v "${prefix}-clang")")"
-          osxcross_root="$(cd "${osxcross_bin}/.." && pwd)"
-          sdk_dir="${osxcross_root}/SDK"
-          if [ -d "${sdk_dir}" ]; then
-            sdkroot="$(ls -d "${sdk_dir}"/MacOSX*.sdk 2>/dev/null | sort -V | tail -n1)"
-            if [ -n "${sdkroot}" ]; then
-              export SDKROOT="${sdkroot}"
-            fi
-          fi
-          export MACOSX_DEPLOYMENT_TARGET="11.0"
-          ld_path=""
-          for name in "${prefix}-ld" "${prefix}-ld64" "ld64" "ld"; do
-            if [ -x "${osxcross_bin}/${name}" ]; then
-              ld_path="${osxcross_bin}/${name}"
-              break
-            fi
-          done
-          export "CC_${target_env}=${osxcross_bin}/${prefix}-clang"
-          export "CXX_${target_env}=${osxcross_bin}/${prefix}-clang++"
-          export "AR_${target_env}=${osxcross_bin}/${prefix}-ar"
-          export "RANLIB_${target_env}=${osxcross_bin}/${prefix}-ranlib"
-          export "CARGO_TARGET_${target_env_upper}_LINKER=${osxcross_bin}/${prefix}-clang"
-          if [ -n "${ld_path}" ]; then
-            export "CFLAGS_${target_env}=-fuse-ld=${ld_path}"
-            export "CXXFLAGS_${target_env}=-fuse-ld=${ld_path}"
-            export "LDFLAGS_${target_env}=-fuse-ld=${ld_path}"
-            export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-fuse-ld=${ld_path}"
-          fi
-          cargo build --bins --workspace --release --target ${{ matrix.target }}
+          cargo build --bins --workspace --release --target "${{ matrix.target }}"
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/plumeimpactor dist/plumeimpactor-macos-${{ matrix.suffix }}
-          cp target/${{ matrix.target }}/release/plumesign dist/plumesign-macos-${{ matrix.suffix }}
+          cp "target/${{ matrix.target }}/release/plumeimpactor" "dist/plumeimpactor-macos-${{ matrix.suffix }}"
+          cp "target/${{ matrix.target }}/release/plumesign" "dist/plumesign-macos-${{ matrix.suffix }}"
 
       - name: Upload ${{ matrix.arch }} Slice
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.BINARY_NAME }}-macos-slice-${{ matrix.arch }}
           path: dist/*
@@ -200,22 +159,22 @@ jobs:
     runs-on: macos-latest
     needs: [build-macos-slices]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Get ARM Slice
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-macos-slice-arm
           path: dist/slices
 
       - name: Get Intel Slice
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-macos-slice-intel
           path: dist/slices
 
       - name: Setup Certificates
-        uses: apple-actions/import-codesign-certs@v5
+        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
         with:
           p12-file-base64: ${{ secrets.DEV_ID_P12_BASE64 }}
           p12-password: ${{ secrets.DEV_ID_P12_PASSWORD }}
@@ -256,7 +215,7 @@ jobs:
           xcrun stapler staple dist/${{ env.BUNDLE_NAME }}-macos-universal.dmg
 
       - name: Upload Universal DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.BINARY_NAME }}-macos-universal
           path: |
@@ -265,60 +224,61 @@ jobs:
 
   release:
     runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [build-linux, build-windows-installer, build-macos-universal]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download Linux x86_64 Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-linux-x86_64
           path: prepare/
 
       - name: Download Linux aarch64 Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-linux-aarch64
           path: prepare/
 
       - name: Download Windows x86_64 Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-x86_64
           path: prepare/
 
       - name: Download Windows x86_64 Installer Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-installer-x86_64
           path: prepare/
 
       - name: Download Windows arm64 Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-arm64
           path: prepare/
 
       - name: Download Windows arm64 Installer Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-installer-arm64
           path: prepare/
 
       - name: Download Windows x86 Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-x86
           path: prepare/
 
       - name: Download Windows x86 Installer Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-windows-installer-x86
           path: prepare/
 
       - name: Download MacOS Universal Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
         with:
           name: ${{ env.BINARY_NAME }}-macos-universal
           path: prepare/
@@ -339,7 +299,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v3.0.2
         with:
           name: v${{ steps.get_version.outputs.version }}
           tag_name: v${{ steps.get_version.outputs.version }}

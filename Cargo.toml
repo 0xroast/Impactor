@@ -14,7 +14,7 @@ default-members = ["apps/plumeimpactor"]
 
 [workspace.package]
 edition = "2024"
-version = "2.6.0"
+version = "2.6.5"
 authors = ["C <claration@riseup.net>"]
 license = "MIT"
 repository = "https://github.com/claration/Impactor"
@@ -72,6 +72,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
     "gzip",
+    "system-proxy",
 ] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -81,3 +82,6 @@ serde_json = { version = "1" }
 # Delete this section once those changes land upstream and the rev above is bumped.
 [patch."https://github.com/jkcoxson/idevice"]
 idevice = { path = "../idevice/idevice" }
+
+[patch.crates-io]
+apple-codesign = { path = "3rdparty/apple-codesign-0.29.0" }

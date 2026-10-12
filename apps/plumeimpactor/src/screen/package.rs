@@ -27,6 +27,7 @@ pub enum Message {
     UpdateInstallMode(SignerInstallMode),
     AddTweak,
     AddBundle,
+    SelectedPaths(SelectionKind, Vec<PathBuf>),
     RemoveTweak(usize),
     SetCustomIcon,
     ClearCustomIcon,
@@ -34,6 +35,14 @@ pub enum Message {
     ClearCustomEntitlements,
     Back,
     RequestInstallation,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SelectionKind {
+    Tweak,
+    Bundle,
+    Image,
+    Entitlements,
 }
 
 #[derive(Debug, Clone)]
@@ -152,33 +161,55 @@ impl PackageScreen {
                 self.options.install_mode = mode;
                 Task::none()
             }
-            Message::AddTweak => {
-                let path = rfd::FileDialog::new()
-                    .add_filter("Tweak files", &["deb", "dylib"])
-                    .set_title("Select Tweak File")
-                    .pick_file();
+            Message::AddTweak => Task::perform(
+                async {
+                    rfd::FileDialog::new()
+                        .add_filter("Tweak files", &["deb", "dylib"])
+                        .set_title("Select Tweak File(s)")
+                        .pick_files()
+                },
+                |paths| Message::SelectedPaths(SelectionKind::Tweak, paths.unwrap_or_default()),
+            ),
+            Message::AddBundle => Task::perform(
+                async {
+                    rfd::FileDialog::new()
+                        .set_title("Select Bundle Folder(s)")
+                        .pick_folders()
+                        .unwrap_or_default()
+                },
+                |paths| Message::SelectedPaths(SelectionKind::Bundle, paths),
+            ),
+            Message::SelectedPaths(kind, paths) => {
+                match kind {
+                    SelectionKind::Tweak => match &mut self.options.tweaks {
+                        Some(tweaks) => tweaks.extend(paths),
+                        None => self.options.tweaks = Some(paths),
+                    },
 
-                if let Some(path) = path {
-                    match &mut self.options.tweaks {
-                        Some(vec) => vec.push(path),
-                        None => self.options.tweaks = Some(vec![path]),
-                    }
-                }
-
-                Task::none()
-            }
-            Message::AddBundle => {
-                let path = rfd::FileDialog::new()
-                    .set_title("Select Bundle Folder")
-                    .pick_folder();
-
-                if let Some(path) = path {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if ["framework", "bundle", "appex"].contains(&ext) {
-                            match &mut self.options.tweaks {
-                                Some(vec) => vec.push(path),
-                                None => self.options.tweaks = Some(vec![path]),
+                    SelectionKind::Bundle => {
+                        for path in paths {
+                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                                if ["framework", "bundle", "appex"].contains(&ext) {
+                                    match &mut self.options.tweaks {
+                                        Some(tweaks) => tweaks.push(path),
+                                        None => self.options.tweaks = Some(vec![path]),
+                                    }
+                                }
                             }
+                        }
+                    }
+                    SelectionKind::Image => {
+                        let path = paths.into_iter().next();
+                        if let Some(path) = path {
+                            self.options.custom_icon = Some(path.clone());
+                            self.custom_icon_path = Some(path.clone());
+                            self.custom_icon_handle = icon_handle_from_path(&path);
+                        }
+                    }
+                    SelectionKind::Entitlements => {
+                        let path = paths.into_iter().next();
+                        if let Some(path) = path {
+                            self.options.custom_entitlements = Some(path);
                         }
                     }
                 }
@@ -193,38 +224,32 @@ impl PackageScreen {
                 }
                 Task::none()
             }
-            Message::SetCustomIcon => {
-                let path = rfd::FileDialog::new()
-                    .add_filter("Image files", &["png", "jpg", "jpeg"])
-                    .set_title("Select App Icon")
-                    .pick_file();
-
-                if let Some(path) = path {
-                    self.options.custom_icon = Some(path.clone());
-                    self.custom_icon_path = Some(path.clone());
-                    self.custom_icon_handle = icon_handle_from_path(&path);
-                }
-
-                Task::none()
-            }
+            Message::SetCustomIcon => Task::perform(
+                async {
+                    rfd::FileDialog::new()
+                        .add_filter("Image files", &["png", "jpg", "jpeg"])
+                        .set_title("Select App Icon")
+                        .pick_file()
+                },
+                |path| Message::SelectedPaths(SelectionKind::Image, path.into_iter().collect()),
+            ),
             Message::ClearCustomIcon => {
                 self.options.custom_icon = None;
                 self.custom_icon_path = None;
                 self.custom_icon_handle = None;
                 Task::none()
             }
-            Message::SetCustomEntitlements => {
-                let path = rfd::FileDialog::new()
-                    .add_filter("Entitlements plist", &["plist", "xml"])
-                    .set_title("Select Entitlements File")
-                    .pick_file();
-
-                if let Some(path) = path {
-                    self.options.custom_entitlements = Some(path);
-                }
-
-                Task::none()
-            }
+            Message::SetCustomEntitlements => Task::perform(
+                async {
+                    rfd::FileDialog::new()
+                        .add_filter("Entitlements plist", &["plist", "xml", "entitlements"])
+                        .set_title("Select Entitlements File")
+                        .pick_file()
+                },
+                |path| {
+                    Message::SelectedPaths(SelectionKind::Entitlements, path.into_iter().collect())
+                },
+            ),
             Message::ClearCustomEntitlements => {
                 self.options.custom_entitlements = None;
                 Task::none()

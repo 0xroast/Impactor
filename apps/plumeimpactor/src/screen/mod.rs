@@ -87,6 +87,7 @@ pub enum Message {
 pub struct Impactor {
     current_screen: ImpactorScreen,
     previous_screen: Option<Box<ImpactorScreen>>,
+    installer_screen: Option<package::PackageScreen>,
     devices: Vec<Device>,
     selected_device: Option<Device>,
     tray: Option<ImpactorTray>,
@@ -141,6 +142,7 @@ impl Impactor {
             Self {
                 current_screen: ImpactorScreen::Main(general::GeneralScreen::new()),
                 previous_screen: None,
+                installer_screen: None,
                 devices: Vec::new(),
                 selected_device: None,
                 tray: Some(tray),
@@ -330,7 +332,11 @@ impl Impactor {
                     Task::none()
                 }
                 ImpactorScreen::Progress(_) => {
-                    self.navigate_to_screen(ImpactorScreenType::Main);
+                    if let Some(installer) = self.installer_screen.take() {
+                        self.current_screen = ImpactorScreen::Installer(installer);
+                    } else {
+                        self.navigate_to_screen(ImpactorScreenType::Main);
+                    }
                     Task::none()
                 }
                 ImpactorScreen::TvOsPairing(_) => {
@@ -1005,9 +1011,10 @@ impl Impactor {
         match screen_type {
             ImpactorScreenType::Main => {
                 if let ImpactorScreen::Installer(installer) = &self.current_screen {
-                    if let Some(package) = installer.selected_package.clone() {
-                        package.remove_package_stage();
-                    }
+                    Self::cleanup_package_stage(installer);
+                }
+                if let Some(installer) = self.installer_screen.take() {
+                    Self::cleanup_package_stage(&installer);
                 }
 
                 self.current_screen = ImpactorScreen::Main(general::GeneralScreen::new());
@@ -1033,6 +1040,15 @@ impl Impactor {
         }
     }
 
+    fn cleanup_package_stage(installer: &package::PackageScreen) {
+        if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_ok() {
+            return;
+        }
+        if let Some(package) = installer.selected_package.clone() {
+            package.remove_package_stage();
+        }
+    }
+
     fn start_installation_task(&mut self) -> Task<Message> {
         if let ImpactorScreen::Installer(installer) = &self.current_screen {
             let Some(package) = installer.selected_package.clone() else {
@@ -1052,7 +1068,16 @@ impl Impactor {
 
             let mut progress_screen = progress::ProgressScreen::new();
             progress_screen.start_installation(progress_rx.clone());
-            self.current_screen = ImpactorScreen::Progress(progress_screen);
+
+            let previous = std::mem::replace(
+                &mut self.current_screen,
+                ImpactorScreen::Progress(progress_screen),
+            );
+            if let ImpactorScreen::Installer(installer) = previous {
+                if let Some(stale) = self.installer_screen.replace(installer) {
+                    Self::cleanup_package_stage(&stale);
+                }
+            }
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1073,18 +1098,10 @@ impl Impactor {
                                 "Installation complete!".to_string(),
                                 100,
                             ));
-
-                            if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
-                                package.remove_package_stage();
-                            }
                         }
                         Err(e) => {
                             let _ = tx_error
                                 .send(progress::ProgressUpdate::new(format!("Error: {}", e), -1));
-
-                            if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
-                                package.remove_package_stage();
-                            }
                         }
                     }
                 });

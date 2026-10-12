@@ -38,7 +38,7 @@ rcgen = "0.12"
 sha1 = "0.10"             # p12
 p12-keystore = "0.2"      # p12 crate only supports legacy PKCS#12
 # Forks
-apple-codesign = { git = "https://github.com/PlumeImpactor/plume-apple-platform-rs", rev = "428b42f", package = "apple-codesign", default-features = false }
+apple-codesign = { version = "0.29.0", default-features = false }
 omnisette = { path = "../../3rdparty/omnisette", features = [
     "remote-anisette-v3",
 ] }
@@ -48,7 +48,12 @@ srp = "0.7.0-rc.1"
 # It has been fixed already but I am waiting for a new release before I can update the dependency.
 # Using native-tls avoids the issue.
 [target.'cfg(windows)'.dependencies]
-reqwest = { version = "0.13", features = ["json", "gzip", "native-tls"] }
+reqwest = { version = "0.13", features = [
+    "json",
+    "gzip",
+    "native-tls",
+    "system-proxy",
+] }
 
 [features]
 default = []
