@@ -740,7 +740,13 @@ impl Impactor {
                                         if let Some(device) = device_opt {
                                             let daemon = crate::refresh::RefreshDaemon::new();
                                             if let Err(e) = daemon
-                                                .refresh_app(&store, refresh_device, app, &device)
+                                                .refresh_app(
+                                                    &store,
+                                                    refresh_device,
+                                                    app,
+                                                    &device,
+                                                    crate::refresh::RefreshTrigger::Manual,
+                                                )
                                                 .await
                                             {
                                                 log::error!(
@@ -749,17 +755,13 @@ impl Impactor {
                                                     udid,
                                                     e
                                                 );
-                                                notify_rust::Notification::new()
-                                                    .summary("Impactor")
-                                                    .body(&format!(
-                                                        "Failed to refresh {} for {}: {}",
-                                                        app.name.as_deref().unwrap_or("???"),
-                                                        &refresh_device.name,
-                                                        e
-                                                    ))
-                                                    .show()
-                                                    .ok();
                                             }
+                                        } else {
+                                            crate::refresh::notify(&format!(
+                                                "Could not find {} to refresh {}",
+                                                &refresh_device.name,
+                                                app.name.as_deref().unwrap_or("???")
+                                            ));
                                         }
                                     }
                                 }
@@ -771,6 +773,7 @@ impl Impactor {
             }
             Message::ForgetApp { udid, app_path } => {
                 if let Some(store) = &mut self.account_store {
+                    *store = Self::init_account_store_sync();
                     if let Some(mut refresh_device) = store.get_refresh_device(&udid).cloned() {
                         if let Some(app) = refresh_device
                             .apps

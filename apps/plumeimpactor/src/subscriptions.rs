@@ -843,6 +843,10 @@ pub(crate) async fn run_installation(
             .map_err(|e| e.to_string())?;
 
         if let (Some(dev), Some(account), Some(store)) = (&device, &account, store.as_mut()) {
+            if let Ok(current) = plume_store::AccountStore::load_sync(&store.path()) {
+                **store = current;
+            }
+
             let embedded_prov_path = dest_path.join("embedded.mobileprovision");
 
             let provision_path = if embedded_prov_path.exists() {
@@ -855,12 +859,7 @@ pub(crate) async fn run_installation(
                 use plume_core::MobileProvision;
 
                 if let Ok(provision) = MobileProvision::load_with_path(&prov_path) {
-                    let expiration_date = provision.expiration_date().clone();
-                    let scheduled_refresh = expiration_date
-                        .to_xml_format()
-                        .parse::<chrono::DateTime<chrono::Utc>>()
-                        .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::days(4));
-                    let scheduled_refresh = scheduled_refresh - chrono::Duration::days(3);
+                    let scheduled_refresh = crate::refresh::scheduled_refresh_for(&provision);
 
                     let refresh_app = plume_store::RefreshApp {
                         name: package_file.get_name(),

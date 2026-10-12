@@ -1,7 +1,7 @@
 use super::{Bundle, PlistInfoTrait};
 use crate::{Error, SignerApp, SignerOptions, cgbi};
 use plist::Dictionary;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs, io::Read};
 use uuid::Uuid;
 use zip::ZipArchive;
@@ -190,41 +190,13 @@ impl Package {
         let mut zip = zip::ZipWriter::new(file);
         let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        let payload_dir = self.stage_payload_dir;
-
-        fn add_dir_to_zip(
-            zip: &mut zip::ZipWriter<fs::File>,
-            path: &PathBuf,
-            prefix: &PathBuf,
-            options: &FileOptions<'_, zip::write::ExtendedFileOptions>,
-        ) -> Result<(), Error> {
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                let entry_path = entry.path();
-                // Zip entry names are separated by '/' on every platform, and readers split on
-                // it to find a bundle: `to_string_lossy` on a relative path would hand them
-                // Windows separators and leave the archive unreadable.
-                let name = entry_path
-                    .strip_prefix(prefix)
-                    .map_err(|_| Error::PackageInfoPlistMissing)?
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-
-                if entry_path.is_file() {
-                    zip.start_file(&name, options.clone())?;
-                    let mut f = fs::File::open(&entry_path)?;
-                    std::io::copy(&mut f, zip)?;
-                } else if entry_path.is_dir() {
-                    zip.add_directory(&name, options.clone())?;
-                    add_dir_to_zip(zip, &entry_path, prefix, options)?;
-                }
-            }
-            Ok(())
-        }
-
-        add_dir_to_zip(&mut zip, &payload_dir, &self.stage_dir, &options)?;
+        add_dir_to_zip(
+            &mut zip,
+            &self.stage_payload_dir,
+            &self.stage_dir,
+            "",
+            &options,
+        )?;
         zip.finish()?;
 
         Ok(zip_file_path)
@@ -232,6 +204,100 @@ impl Package {
 
     pub fn remove_package_stage(self) {
         fs::remove_dir_all(&self.stage_dir).ok();
+    }
+}
+
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<fs::File>,
+    path: &Path,
+    prefix: &Path,
+    name_prefix: &str,
+    options: &FileOptions<'_, zip::write::ExtendedFileOptions>,
+) -> Result<(), Error> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        // Zip entry names are separated by '/' on every platform, and readers split on
+        // it to find a bundle: `to_string_lossy` on a relative path would hand them
+        // Windows separators and leave the archive unreadable.
+        let relative = entry_path
+            .strip_prefix(prefix)
+            .map_err(|_| Error::PackageInfoPlistMissing)?
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let name = if name_prefix.is_empty() {
+            relative
+        } else {
+            format!("{name_prefix}/{relative}")
+        };
+
+        if entry_path.is_file() {
+            zip.start_file(&name, options.clone())?;
+            let mut f = fs::File::open(&entry_path)?;
+            std::io::copy(&mut f, zip)?;
+        } else if entry_path.is_dir() {
+            zip.add_directory(&name, options.clone())?;
+            add_dir_to_zip(zip, &entry_path, prefix, name_prefix, options)?;
+        }
+    }
+    Ok(())
+}
+
+/// Zips a bundle directory (e.g. `Foo.app`) into an IPA at `dest`, with the bundle under
+/// `Payload/`. Lets a caller that holds only a signed bundle directory, with no `Package`
+/// behind it, send a single archive instead of the directory tree.
+pub fn archive_bundle_dir(bundle_dir: &Path, dest: &Path) -> Result<(), Error> {
+    let app_name = bundle_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Other(format!("Invalid bundle path: {}", bundle_dir.display())))?;
+
+    let file = fs::File::create(dest)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let root = format!("Payload/{app_name}");
+    zip.add_directory(&root, options.clone())?;
+    add_dir_to_zip(&mut zip, bundle_dir, bundle_dir, &root, &options)?;
+    zip.finish()?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod archive_bundle_dir_tests {
+    use super::*;
+
+    #[test]
+    fn bundle_lands_under_payload_with_forward_slash_names() {
+        let root = env::temp_dir().join(format!("plume_archive_test_{}", Uuid::new_v4()));
+        let bundle = root.join("Foo.app");
+        fs::create_dir_all(bundle.join("sub")).unwrap();
+        fs::write(bundle.join("Info.plist"), b"plist").unwrap();
+        fs::write(bundle.join("sub").join("inner.txt"), b"inner").unwrap();
+        let dest = root.join("out.ipa");
+
+        archive_bundle_dir(&bundle, &dest).unwrap();
+
+        let mut archive = ZipArchive::new(fs::File::open(&dest).unwrap()).unwrap();
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        assert!(names.contains(&"Payload/Foo.app/".to_string()));
+        assert!(names.contains(&"Payload/Foo.app/Info.plist".to_string()));
+        assert!(names.contains(&"Payload/Foo.app/sub/".to_string()));
+        assert!(names.contains(&"Payload/Foo.app/sub/inner.txt".to_string()));
+        assert!(names.iter().all(|name| !name.contains('\\')));
+
+        let mut inner = String::new();
+        archive
+            .by_name("Payload/Foo.app/sub/inner.txt")
+            .unwrap()
+            .read_to_string(&mut inner)
+            .unwrap();
+        assert_eq!(inner, "inner");
+
+        fs::remove_dir_all(&root).ok();
     }
 }
 

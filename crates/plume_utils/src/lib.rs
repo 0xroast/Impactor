@@ -21,7 +21,7 @@ pub use options::{
     SignerMode,        // Signing mode
     SignerOptions,     // Main
 };
-pub use package::Package; // Package helper
+pub use package::{Package, archive_bundle_dir}; // Package helper
 pub use signer::Signer; // Signer
 pub use tweak::Tweak; // Tweak helper
 
