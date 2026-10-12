@@ -16,6 +16,7 @@ mod relaunch;
 mod screen;
 mod startup;
 mod subscriptions;
+mod toast;
 mod tray;
 
 pub const APP_NAME: &str = "Impactor";
@@ -63,6 +64,8 @@ fn main() -> iced::Result {
         notify_rust::get_bundle_identifier_or_default("Impactor");
         notify_rust::set_application("dev.khcrysalis.PlumeImpactor").ok();
     }
+
+    toast::register(&defaults::get_data_path());
 
     let (_daemon_handle, connected_devices) = spawn_refresh_daemon();
     screen::set_refresh_daemon_devices(connected_devices);

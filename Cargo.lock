@@ -5725,6 +5725,7 @@ dependencies = [
  "tray-icon",
  "uuid",
  "wgpu",
+ "windows-registry 0.6.1",
  "winresource",
 ]
 
